@@ -592,7 +592,119 @@ impl<'db> Semantics<'db> {
                 let idx = *methods_named(db, class, &name).first()?;
                 Some(Definition::Method(MethodId { class, idx }))
             }
-            _ => self.body_resolution(file, node),
+            _ => self
+                .body_resolution(file, node)
+                .or_else(|| self.annotation_value_name(file, name_ref)),
+        }
+    }
+
+    /// 注解元素值里的名字（`@Produces(MediaType.TEXT_PLAIN)`、`@Foo(BAR)`）：
+    /// 不在任何体的推断里，按常量表达式的名字静态解析。
+    fn annotation_value_name(
+        &self,
+        file: SourceFile,
+        name_ref: &ast::NameRef,
+    ) -> Option<Definition> {
+        let node = name_ref.syntax();
+        node.ancestors()
+            .find(|n| n.kind() == SyntaxKind::ANNOTATION_ARG_LIST)?;
+        let parent = node.parent()?;
+        let name = name_ref.text();
+        match parent.kind() {
+            SyntaxKind::NAME_EXPR => self.annotation_simple_name(file, node, &name),
+            SyntaxKind::FIELD_ACCESS => {
+                let qualifier = parent.children().find(|c| c != node)?;
+                let qualifier = self.annotation_qualifier(file, &qualifier)?;
+                self.annotation_member(&qualifier, &name)
+            }
+            _ => None,
+        }
+    }
+
+    /// 限定名 `a.b.C.FIELD` 里 `.` 前面的部分：类或包。
+    fn annotation_qualifier(&self, file: SourceFile, expr: &SyntaxNode) -> Option<Definition> {
+        let def = match expr.kind() {
+            SyntaxKind::NAME_EXPR => {
+                let name_ref = expr.children().find_map(ast::NameRef::cast)?;
+                self.annotation_simple_name(file, name_ref.syntax(), &name_ref.text())?
+            }
+            SyntaxKind::FIELD_ACCESS => {
+                let mut children = expr.children();
+                let qualifier = children.next()?;
+                let name_ref = children.find_map(ast::NameRef::cast)?;
+                let qualifier = self.annotation_qualifier(file, &qualifier)?;
+                self.annotation_member(&qualifier, &name_ref.text())?
+            }
+            _ => return None,
+        };
+        matches!(def, Definition::Class(_) | Definition::Package(_)).then_some(def)
+    }
+
+    /// 类的字段或成员类、包里的类或子包。
+    fn annotation_member(&self, qualifier: &Definition, name: &str) -> Option<Definition> {
+        let db = self.db;
+        match qualifier {
+            Definition::Class(class) => {
+                if let Some(field) = lookup_field(db, &Ty::class(*class), name) {
+                    return Some(Definition::Field(field.id));
+                }
+                member_type(db, *class, name).map(Definition::Class)
+            }
+            Definition::Package(package) => {
+                let mut segments: Vec<Name> = package.split('/').map(Name::new).collect();
+                segments.push(Name::new(name));
+                if let Some(class) = resolve_qualified_class(db, &segments) {
+                    return Some(Definition::Class(class));
+                }
+                let package = segments.join("/");
+                package_exists(db, &package).then(|| Definition::Package(SmolStr::new(package)))
+            }
+            _ => None,
+        }
+    }
+
+    /// 简单名：外围各层类的字段（含继承来的）、static import 的字段，然后是类型、包。
+    fn annotation_simple_name(
+        &self,
+        file: SourceFile,
+        node: &SyntaxNode,
+        name: &str,
+    ) -> Option<Definition> {
+        let db = self.db;
+        let scope = self.type_scope(file, node);
+        let mut class = scope.class;
+        while let Some(current) = class {
+            if let Some(field) = lookup_field(db, &Ty::class(current), name) {
+                return Some(Definition::Field(field.id));
+            }
+            class = hir_def::outer_class(db, current);
+        }
+        let file_scope = file_scope(db, file);
+        let mut imports: Vec<_> = file_scope.static_imports().collect();
+        // 单个成员的 static import 遮蔽按需的
+        imports.sort_by_key(|import| import.is_on_demand);
+        for import in imports {
+            let prefix = if import.is_on_demand {
+                &import.segments[..]
+            } else {
+                match import.segments.split_last() {
+                    Some((last, prefix)) if last == name => prefix,
+                    _ => continue,
+                }
+            };
+            let Some(owner) = resolve_qualified_class_visible(db, file, prefix)
+                .or_else(|| resolve_qualified_class(db, prefix))
+            else {
+                continue;
+            };
+            if let Some(field) = lookup_field(db, &Ty::class(owner), name) {
+                return Some(Definition::Field(field.id));
+            }
+        }
+        match resolve_type_path(db, &scope, &[name]) {
+            Some(TypeNs::Class(class)) => Some(Definition::Class(class)),
+            Some(TypeNs::TypeParam(_)) => None,
+            None => package_exists(db, name).then(|| Definition::Package(SmolStr::new(name))),
         }
     }
 

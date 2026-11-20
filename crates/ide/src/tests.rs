@@ -1603,3 +1603,85 @@ class Main extends spring.Holder {
             .collect();
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+fn goto_in_annotation(marker: &str) -> (String, SymbolKind) {
+    let fx = fixture(&format!(
+        r#"
+//- /m/MediaType.java
+package m;
+public class MediaType {{
+    public static final String TEXT_PLAIN = "text/plain";
+    public static class Nested {{ public static final int N = 1; }}
+}}
+//- /m/Mode.java
+package m;
+public enum Mode {{ FAST, SLOW }}
+//- /m/Produces.java
+package m;
+public @interface Produces {{ String[] value() default "*/*"; Mode mode() default Mode.FAST; int n() default 0; }}
+//- /b/Main.java
+package b;
+import m.MediaType;
+import m.Mode;
+import m.Produces;
+import static m.MediaType.TEXT_PLAIN;
+{marker}
+"#
+    ));
+    let result = navigation::goto_definition(&fx.db, position(&fx)).expect("没有跳转目标");
+    let nav = &result.info[0];
+    (slice(&fx, &nav.file, nav.focus_range).to_string(), nav.kind)
+}
+
+#[test]
+fn goto_definition_in_annotation_values() {
+    let cases = [
+        (
+            "class Main { @Produces(MediaType.TEXT_PL$0AIN) String hello() { return \"\"; } }",
+            "TEXT_PLAIN",
+            SymbolKind::Field,
+        ),
+        (
+            "class Main { @Produces(Media$0Type.TEXT_PLAIN) String hello() { return \"\"; } }",
+            "MediaType",
+            SymbolKind::Class,
+        ),
+        (
+            "@Produces(m.MediaType.TEXT_PL$0AIN) class Main {}",
+            "TEXT_PLAIN",
+            SymbolKind::Field,
+        ),
+        (
+            "@Produces(TEXT_PL$0AIN) class Main {}",
+            "TEXT_PLAIN",
+            SymbolKind::Field,
+        ),
+        (
+            "@Produces(value = {MediaType.TEXT_PL$0AIN}, mode = Mode.SLOW) class Main {}",
+            "TEXT_PLAIN",
+            SymbolKind::Field,
+        ),
+        (
+            "@Produces(mode = Mode.SL$0OW) class Main {}",
+            "SLOW",
+            SymbolKind::EnumConstant,
+        ),
+        (
+            "@Produces(n = MediaType.Nested.$0N) class Main {}",
+            "N",
+            SymbolKind::Field,
+        ),
+        (
+            "class Main { static final String LOCAL = \"x\"; @Produces(LOC$0AL) void f() {} }",
+            "LOCAL",
+            SymbolKind::Field,
+        ),
+    ];
+    for (source, name, kind) in cases {
+        assert_eq!(
+            goto_in_annotation(source),
+            (name.to_string(), kind),
+            "{source}"
+        );
+    }
+}
