@@ -1340,6 +1340,55 @@ mod tests {
     }
 
     #[test]
+    fn poms_starting_with_a_byte_order_mark_import_as_maven() {
+        // Windows 上的编辑器保存的 pom.xml 常以 UTF-8 BOM 开头（l0ng-ai/openidea#4928）
+        let dir = std::env::temp_dir().join(format!("ja-pom-bom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let write = |path: &str, text: String| {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("\u{feff}{text}")).unwrap();
+        };
+        let group = "ja.test.bom";
+        let pom = |artifact: &str, body: &str| {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <project><groupId>{group}</groupId><artifactId>{artifact}</artifactId>\
+                 <version>1</version>{body}</project>"
+            )
+        };
+        write(
+            "pom.xml",
+            pom(
+                "parent",
+                "<packaging>pom</packaging><modules><module>app</module><module>lib</module></modules>",
+            ),
+        );
+        write(
+            "app/pom.xml",
+            pom(
+                "app",
+                &format!(
+                    "<dependencies><dependency><groupId>{group}</groupId>\
+                     <artifactId>lib</artifactId><version>1</version>\
+                     </dependency></dependencies>"
+                ),
+            ),
+        );
+        write("lib/pom.xml", pom("lib", ""));
+        let options = LoadOptions {
+            jdk_home: None,
+            maven_use_cli: false,
+            gradle_allow_run: false,
+        };
+        let loaded = load_project(&dir, &options);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(loaded.kind, ProjectKind::Maven);
+        assert_eq!(module_deps(&loaded.graph, "app"), ["lib"]);
+        assert!(module_deps(&loaded.graph, "lib").is_empty());
+    }
+
+    #[test]
     fn gradle_modules_link_across_roots_by_coordinates() {
         let dir = std::env::temp_dir().join(format!("ja-gradle-cross-root-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

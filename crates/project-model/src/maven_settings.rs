@@ -374,6 +374,14 @@ mod tests {
             Some(r"D:\repo\maven")
         );
         assert_eq!(local_repository_in("<settings></settings>"), None);
+        // Windows 上保存的 settings.xml 可能以 UTF-8 BOM 开头
+        assert_eq!(
+            local_repository_in(
+                "\u{feff}<settings><localRepository>/data/m2</localRepository></settings>"
+            )
+            .as_deref(),
+            Some("/data/m2")
+        );
     }
 
     #[test]

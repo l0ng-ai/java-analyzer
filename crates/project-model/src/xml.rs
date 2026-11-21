@@ -48,6 +48,8 @@ impl XmlNode {
 }
 
 pub fn parse(input: &str) -> Option<XmlNode> {
+    // Windows 上的编辑器常在 UTF-8 文件开头写 BOM（U+FEFF）；它不算空白，`trim_start` 去不掉
+    let input = input.strip_prefix('\u{feff}').unwrap_or(input);
     let mut parser = Parser { s: input, pos: 0 };
     parser.skip_misc();
     let root = parser.element()?;
@@ -255,6 +257,17 @@ mod tests {
             .collect();
         assert_eq!(deps.len(), 2);
         assert!(deps[1].child("optional").is_some());
+    }
+
+    #[test]
+    fn leading_byte_order_mark_is_skipped() {
+        let root = parse(
+            "\u{feff}<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<project><artifactId>demo</artifactId></project>",
+        )
+        .unwrap();
+        assert_eq!(root.name, "project");
+        assert_eq!(root.child_text("artifactId"), Some("demo"));
+        assert_eq!(parse("\u{feff}<project/>").unwrap().name, "project");
     }
 
     #[test]
