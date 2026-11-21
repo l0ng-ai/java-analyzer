@@ -430,12 +430,13 @@ pub fn resolve_type_path<S: AsRef<str>>(
 /// 在作用域里按二进制名查找类（class 文件签名、Lombok 生成的成员里已经确定的类名）。
 /// 同名的类有多份时：先找和当前类同一来源的那一份，再找这个文件看得到的；都没有时取主副本。
 pub fn lookup_class_in_scope(db: &dyn Db, scope: &TypeScope, binary_name: &str) -> Option<ClassId> {
-    if let Some(class) = scope.class.filter(|class| class.is_copy()) {
-        if let Some(found) =
-            class_origin(db, class).and_then(|origin| class_in_origin(db, binary_name, origin))
-        {
-            return Some(found);
-        }
+    // 所有类都按来源找，不只副本：主副本也可能和它的外层类不在同一个文件里（见 `sibling_class`）
+    if let Some(found) = scope
+        .class
+        .and_then(|class| class_origin(db, class))
+        .and_then(|origin| class_in_origin(db, binary_name, origin))
+    {
+        return Some(found);
     }
     match scope.file {
         Some(file) => {

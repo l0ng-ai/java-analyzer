@@ -467,11 +467,13 @@ pub fn binary_class(db: &dyn Db, binary_name: &str) -> Option<ClassId> {
 }
 
 /// 和 `of` 同一来源（同一个源码文件或同一个 jar）里的类 `binary_name`：成员类型、外层类都跟着
-/// 所在的那一份走。`of` 是主副本时就是全局查找。
+/// 所在的那一份走。
+///
+/// 不能按 `is_copy()` 走全局查找：主副本指的是"这个名字全局取哪一份"，和"这个类声明在哪个
+/// 文件里"不是一回事。同名的类有多份而 `of` 是主副本时，`of` 的外层类完全可能只声明在
+/// 别的副本里（另一个文件里的 `Dup` 没有 `Dup$Inner`，于是 `Inner` 只能来自那一份），
+/// 这时按名字全局查会查到一个没有该外层类的副本，外层类的成员就全都解析失败。
 pub fn sibling_class(db: &dyn Db, of: ClassId, binary_name: &str) -> Option<ClassId> {
-    if !of.is_copy() {
-        return lookup_class(db, binary_name);
-    }
     match class_origin(db, of)? {
         origin @ ClassOrigin::Source { .. } => class_in_origin(db, binary_name, origin),
         origin @ ClassOrigin::Binary { .. } => {
@@ -495,8 +497,10 @@ pub fn outer_class(db: &dyn Db, class: ClassId) -> Option<ClassId> {
 pub fn outermost_class(db: &dyn Db, class: ClassId) -> ClassId {
     let name = class.binary_name(db);
     match name.split_once('$') {
-        // 主副本的外层类也是主副本：不必查索引（访问性检查的热路径上）
-        Some((outer, _)) if !class.is_copy() => ClassId::from_binary_name(db, outer),
+        // 外层类没有同名副本时，主副本的外层类也是主副本：不必查索引（访问性检查的热路径上）
+        Some((outer, _)) if !class.is_copy() && !has_copies(db, outer) => {
+            ClassId::from_binary_name(db, outer)
+        }
         Some((outer, _)) => sibling_class(db, class, outer).unwrap_or(class),
         None => class,
     }

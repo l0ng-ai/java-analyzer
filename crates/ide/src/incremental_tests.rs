@@ -491,3 +491,45 @@ public class Dup {
         assert_eq!(file_of(&found[0].entry.def), Some(source(&fx, path)));
     }
 }
+
+/// 同名的类有多份时，外层类跟着**声明它的那个文件**走，而不是按名字全局取主副本。
+///
+/// `Dup$Inner` 只在第二份里声明，所以它是自己的主副本（`is_copy()` 为假）；但它的外层类
+/// `Dup` 有两份，全局查会拿到第一份——那里没有 `Inner` 的外层成员，裸调 `m()` 就解析不到。
+#[test]
+fn nested_class_resolves_outer_members_from_its_own_file() {
+    let fx = fixture(
+        r#"
+//- /a/p/Dup.java
+package p;
+
+public class Dup {
+    void only() {}
+}
+//- /b/p/Dup.java
+package p;
+
+public class Dup {
+    static String m() { return "t"; }
+    static final String C = "c";
+
+    public static class Inner {
+        void run() {
+            System.out.println(m() + C);
+        }
+    }
+}
+"#,
+    );
+    let file = source(&fx, "/b/p/Dup.java");
+    // diagnostics_of 用 Debug 格式渲染代码，所以这里匹配 DiagnosticCode 的名字
+    let (messages, _) = diagnostics_of(&fx.db, file);
+    let unresolved: Vec<&String> = messages
+        .iter()
+        .filter(|m| m.starts_with("UnresolvedMethod") || m.starts_with("UnresolvedName"))
+        .collect();
+    assert!(
+        unresolved.is_empty(),
+        "外层类的成员应当解析得到: {unresolved:?}"
+    );
+}
