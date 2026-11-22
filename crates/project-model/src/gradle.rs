@@ -42,7 +42,12 @@ def javaAnalyzerBuildPath = { g ->
 allprojects { p ->
     p.afterEvaluate {
         def sourceSets = p.extensions.findByName('sourceSets')
-        if (sourceSets == null) {
+        def androidExtension = p.extensions.findByName('android')
+        // AGP Android projects expose no top-level `sourceSets` (their sources live under
+        // the `android` extension), so the vanilla check below would skip the whole module.
+        // Keep such projects: the model task has a dedicated AGP branch that reads the
+        // boot classpath (android.jar) and the variants' compile classpaths.
+        if (sourceSets == null && androidExtension == null) {
             return
         }
         def javaExtension = p.extensions.findByName('java')
@@ -58,6 +63,55 @@ allprojects { p ->
         def model = p.tasks.register('javaAnalyzerModel') {
             doLast {
                 def sets = []
+
+                // ---- Android (AGP) projects ----
+                // AGP has no top-level Java sourceSets, so iterate the Android variants and
+                // take the boot classpath (android.jar) plus each variant's javac classpath.
+                // This is done here in doLast because AGP populates bootClasspath/variants
+                // only once the configuration phase is fully over (afterEvaluate is too early).
+                if (androidExtension != null) {
+                    def boot = []
+                    try { boot = (androidExtension.bootClasspath ?: []).collect { it.absolutePath } } catch (Throwable ignored) {}
+                    def srcDirsAll = [] as LinkedHashSet
+                    def cpAll = [] as LinkedHashSet
+                    def variants = []
+                    try { variants = androidExtension.applicationVariants ?: [] } catch (Throwable ignored) {}
+                    if (variants.isEmpty()) {
+                        try { variants = androidExtension.libraryVariants ?: [] } catch (Throwable ignored) {}
+                    }
+                    variants.each { v ->
+                        try {
+                            def jc = v.javaCompileProvider.get()
+                            jc.classpath.files.each { cpAll << it.absolutePath }
+                            // javac source is a FilteredFileTree; get its srcDirs via the variant's
+                            // sourceSets instead, which is stable across AGP versions.
+                            v.sourceSets.each { sset ->
+                                sset.java.srcDirs.each { srcDirsAll << it.absolutePath }
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                    // Fallback source dirs from the well-known AGP layout when variant sourceSets
+                    // did not yield anything.
+                    if (srcDirsAll.isEmpty()) {
+                        ['src/main/java', 'src/main/kotlin'].each { rel ->
+                            def d = new File(p.projectDir, rel)
+                            if (d.isDirectory()) srcDirsAll << d.absolutePath
+                        }
+                    }
+                    def agpCp = []
+                    boot.each { agpCp << it }
+                    cpAll.each { agpCp << it }
+                    sets << [
+                        name       : 'main',
+                        srcDirs    : srcDirsAll.toList(),
+                        classpath  : agpCp,
+                        outputDirs : [],
+                        coordinates: [:],
+                        unresolved : [],
+                    ]
+                }
+
                 sourceSets.each { ss ->
                     def classpath = []
                     def coordinates = [:]
@@ -104,6 +158,17 @@ allprojects { p ->
                 try {
                     level = javaExtension?.sourceCompatibility?.majorVersion
                 } catch (Throwable ignored) {
+                }
+                // AGP projects have no `java` extension; fall back to the compile tasks' release
+                // (set by compileOptions/JavaVersion) or a sane default for modern Android.
+                if (level == null && androidExtension != null) {
+                    try {
+                        compileTasks.each { task ->
+                            def r = task.options.release.getOrNull()
+                            if (r != null) { level = r.toString() }
+                        }
+                    } catch (Throwable ignored) {
+                    }
                 }
                 def preview = false
                 def release = null
