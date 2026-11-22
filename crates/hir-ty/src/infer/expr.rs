@@ -1854,6 +1854,24 @@ impl InferCtx<'_> {
                     let mut produced = self.infer_method_ref(method_ref, Some(&target));
                     if method_ref.is_constructor() {
                         produced = self.parameterize_constructor_ref(&call, idx, produced);
+                        // 构造器引用的函数类型形参也被选定构造器的形参约束：
+                        // `Func<X, Scalar<Y>>` 收 `IsBlank::new`（唯一构造器 `IsBlank(Textish)`）
+                        // 时 `X := Textish`——javac 由方法引用的编译期声明得出同样的约束。
+                        // 缺了它，菱形构造的类型参数停在 `?` 上，外层重载决议就分不清谁适用
+                        if let Some(Resolution::Method(chosen)) = self
+                            .result
+                            .resolutions
+                            .get(&method_ref.syntax().text_range())
+                        {
+                            let chosen_params = method_sig(db, *chosen).params.clone();
+                            if let Some((inputs, _)) = self.functional_sig(&target) {
+                                if inputs.len() == chosen_params.len() {
+                                    for (input, param) in inputs.iter().zip(chosen_params.iter()) {
+                                        call.inference.unify(db, input, param);
+                                    }
+                                }
+                            }
+                        }
                     }
                     Some((produced, target))
                 }
