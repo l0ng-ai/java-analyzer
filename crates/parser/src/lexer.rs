@@ -4,8 +4,11 @@
 //! - `>` 永远单独成 token（`>=` 除外），`>>`、`>>>`、`>>=`、`>>>=` 由 parser 根据相邻关系拼接，
 //!   这样泛型的闭合尖括号不需要特殊处理。
 //! - 上下文关键字（`var`、`record`、`sealed` …）一律产出 `IDENT`。
+//! - token 的 `len` 恒为**原始源码**里的字节数：JLS 3.3 的 `\uXXXX` 翻译只改变
+//!   词法判断所用的逻辑字符序列，语法树读原文切片，保持无损。
 
 use crate::SyntaxKind::{self, *};
+use std::borrow::Cow;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Token {
@@ -23,26 +26,169 @@ pub struct LexError {
 
 pub fn tokenize(text: &str) -> (Vec<Token>, Vec<LexError>) {
     let mut lexer = Lexer {
-        text,
+        src: Source::new(text),
         pos: 0,
+        raw_pos: 0,
         errors: Vec::new(),
     };
     let mut tokens = Vec::with_capacity(text.len() / 4);
-    while lexer.pos < text.len() {
-        let start = lexer.pos;
+    while lexer.pos < lexer.src.logical_len() {
+        let raw_start = lexer.raw_pos;
         let kind = lexer.next_kind();
-        debug_assert!(lexer.pos > start);
+        debug_assert!(lexer.raw_pos > raw_start);
         tokens.push(Token {
             kind,
-            len: (lexer.pos - start) as u32,
+            len: (lexer.raw_pos - raw_start) as u32,
         });
     }
     (tokens, lexer.errors)
 }
 
+/// JLS 3.3 的 Unicode 转义翻译：源码里合格的 `\uXXXX`（前面紧挨着偶数个 `\`）
+/// 在分词之前就替换成它表示的字符——代码、注释、字符串/字符字面量里都生效。
+///
+/// 记录每个逻辑字符在原文里的字节长度，token 才能映射回原文的无损切片。
+struct Translated {
+    /// 翻译后的逻辑字符
+    chars: Vec<char>,
+    /// 逻辑字符之前的原始字节偏移（前缀和，比 `chars` 多一项）
+    offsets: Vec<u32>,
+}
+
+impl Translated {
+    /// 原文里没有 `\u` 时返回 `None`：绝大多数文件走零开销的原文直读路径。
+    fn new(text: &str) -> Option<Translated> {
+        if !text.contains("\\u") {
+            return None;
+        }
+        let mut chars = Vec::with_capacity(text.len() / 2);
+        let mut raw = Vec::with_capacity(text.len() / 2);
+        translate_into(text, &mut chars, &mut raw);
+        let mut offsets = Vec::with_capacity(chars.len() + 1);
+        offsets.push(0u32);
+        for len in &raw {
+            offsets.push(offsets.last().unwrap() + len);
+        }
+        Some(Translated { chars, offsets })
+    }
+}
+
+/// 对一小段原文单独做同样的 JLS 3.3 翻译。
+///
+/// 只用于不含裸 `\` 的 token 文本（标识符里的转义已随翻译消耗掉，token 范围
+/// 内转义前的反斜杠数只会是 0），单独翻译与全文翻译的结果一致。
+pub(crate) fn translate_span(text: &str) -> String {
+    let mut chars = Vec::new();
+    let mut raw = Vec::new();
+    translate_into(text, &mut chars, &mut raw);
+    chars.into_iter().collect()
+}
+
+fn translate_into(text: &str, chars: &mut Vec<char>, raw: &mut Vec<u32>) {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            let run = i;
+            while i < bytes.len() && bytes[i] == b'\\' {
+                i += 1;
+            }
+            let n = i - run;
+            // 只有串长为奇数（最后一个 `\` 前面有偶数个 `\`）且后面紧跟
+            // `u` + 4 个十六进制位时，最后一个 `\` 才开启一个合格的转义
+            let eligible = n % 2 == 1
+                && bytes.get(i) == Some(&b'u')
+                && bytes
+                    .get(i + 1..i + 5)
+                    .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit));
+            if eligible {
+                let code = u32::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 5]).unwrap(), 16)
+                    .unwrap();
+                if let Some(ch) = char::from_u32(code) {
+                    for _ in 0..n - 1 {
+                        chars.push('\\');
+                        raw.push(1);
+                    }
+                    chars.push(ch);
+                    raw.push(6);
+                    // `i` 停在 `u` 上：转义还剩 `u` + 4 个十六进制位共 5 个字节
+                    i += 5;
+                    continue;
+                }
+                // 代理区单独成转义：javac 也拒绝（illegal unicode escape）。
+                // 不翻译，让 `\` 在代码位置自然产出错误诊断。
+            }
+            for _ in 0..n {
+                chars.push('\\');
+                raw.push(1);
+            }
+        } else {
+            let ch = text[i..].chars().next().unwrap();
+            chars.push(ch);
+            raw.push(ch.len_utf8() as u32);
+            i += ch.len_utf8();
+        }
+    }
+}
+
+/// 词法判断所用的字符序列：绝大多数文件直接读原文，含 `\u` 的文件读翻译视图。
+enum Source<'a> {
+    Raw(&'a str),
+    Translated(Translated),
+}
+
+impl<'a> Source<'a> {
+    fn new(text: &'a str) -> Source<'a> {
+        match Translated::new(text) {
+            Some(t) => Source::Translated(t),
+            None => Source::Raw(text),
+        }
+    }
+
+    fn logical_len(&self) -> usize {
+        match self {
+            Source::Raw(text) => text.len(),
+            Source::Translated(t) => t.chars.len(),
+        }
+    }
+
+    fn peek(&self, pos: usize) -> Option<char> {
+        match self {
+            Source::Raw(text) => text[pos..].chars().next(),
+            Source::Translated(t) => t.chars.get(pos).copied(),
+        }
+    }
+
+    fn peek_nth(&self, pos: usize, n: usize) -> Option<char> {
+        match self {
+            Source::Raw(text) => text[pos..].chars().nth(n),
+            Source::Translated(t) => t.chars.get(pos + n).copied(),
+        }
+    }
+
+    /// 逻辑位置换算成原始字节偏移。
+    fn raw_offset(&self, pos: usize) -> usize {
+        match self {
+            Source::Raw(_) => pos,
+            Source::Translated(t) => t.offsets[pos] as usize,
+        }
+    }
+
+    /// token 文本：关键字判断用翻译后的拼写。
+    fn token_text(&self, start: usize, end: usize) -> Cow<'a, str> {
+        match self {
+            Source::Raw(text) => Cow::Borrowed(&text[start..end]),
+            Source::Translated(t) => Cow::Owned(t.chars[start..end].iter().collect()),
+        }
+    }
+}
+
 struct Lexer<'a> {
-    text: &'a str,
+    src: Source<'a>,
+    /// 逻辑位置（Raw 模式即字节下标）
     pos: usize,
+    /// 原始源码里的字节位置
+    raw_pos: usize,
     errors: Vec<LexError>,
 }
 
@@ -60,26 +206,31 @@ fn is_ident_continue(c: char) -> bool {
 
 impl Lexer<'_> {
     fn peek(&self) -> Option<char> {
-        self.text[self.pos..].chars().next()
+        self.src.peek(self.pos)
     }
 
     fn peek_nth(&self, n: usize) -> Option<char> {
-        self.text[self.pos..].chars().nth(n)
-    }
-
-    fn rest(&self) -> &str {
-        &self.text[self.pos..]
+        self.src.peek_nth(self.pos, n)
     }
 
     fn bump(&mut self) -> Option<char> {
-        let c = self.peek()?;
-        self.pos += c.len_utf8();
+        let c = self.src.peek(self.pos)?;
+        match &self.src {
+            Source::Raw(_) => {
+                self.pos += c.len_utf8();
+                self.raw_pos += c.len_utf8();
+            }
+            Source::Translated(t) => {
+                self.raw_pos += t.offsets[self.pos + 1] as usize - t.offsets[self.pos] as usize;
+                self.pos += 1;
+            }
+        }
         Some(c)
     }
 
     fn eat(&mut self, c: char) -> bool {
         if self.peek() == Some(c) {
-            self.pos += c.len_utf8();
+            self.bump();
             true
         } else {
             false
@@ -91,14 +242,32 @@ impl Lexer<'_> {
             if !pred(c) {
                 break;
             }
-            self.pos += c.len_utf8();
+            self.bump();
+        }
+    }
+
+    /// 跳过直到 `a` 后紧跟 `b`（含）；到结尾返回 false，位置停在末尾。
+    fn skip_until_pair(&mut self, a: char, b: char) -> bool {
+        loop {
+            match self.peek() {
+                None => return false,
+                Some(c) if c == a => {
+                    self.bump();
+                    if self.eat(b) {
+                        return true;
+                    }
+                }
+                Some(_) => {
+                    self.bump();
+                }
+            }
         }
     }
 
     fn error(&mut self, start: usize, message: &'static str) {
         self.errors.push(LexError {
-            offset: start as u32,
-            len: (self.pos - start) as u32,
+            offset: self.src.raw_offset(start) as u32,
+            len: (self.raw_pos - self.src.raw_offset(start)) as u32,
             message,
         });
     }
@@ -122,12 +291,8 @@ impl Lexer<'_> {
                 Some('*') => {
                     self.bump();
                     let is_doc = self.peek() == Some('*') && self.peek_nth(1) != Some('/');
-                    match self.rest().find("*/") {
-                        Some(idx) => self.pos += idx + 2,
-                        None => {
-                            self.pos = self.text.len();
-                            self.error(start, "注释未闭合");
-                        }
+                    if !self.skip_until_pair('*', '/') {
+                        self.error(start, "注释未闭合");
                     }
                     if is_doc {
                         DOC_COMMENT
@@ -142,8 +307,9 @@ impl Lexer<'_> {
                 _ => SLASH,
             },
             '"' => {
-                if self.rest().starts_with("\"\"") {
-                    self.pos += 2;
+                if self.peek() == Some('"') && self.peek_nth(1) == Some('"') {
+                    self.bump();
+                    self.bump();
                     self.text_block(start)
                 } else {
                     self.quoted(start, '"', "字符串字面量未闭合");
@@ -158,8 +324,9 @@ impl Lexer<'_> {
             '.' => {
                 if matches!(self.peek(), Some('0'..='9')) {
                     self.decimal_fraction_and_suffix()
-                } else if self.rest().starts_with("..") {
-                    self.pos += 2;
+                } else if self.peek() == Some('.') && self.peek_nth(1) == Some('.') {
+                    self.bump();
+                    self.bump();
                     ELLIPSIS
                 } else {
                     DOT
@@ -167,8 +334,8 @@ impl Lexer<'_> {
             }
             c if is_ident_start(c) => {
                 self.eat_while(is_ident_continue);
-                let text = &self.text[start..self.pos];
-                SyntaxKind::from_keyword(text).unwrap_or(IDENT)
+                let spelling = self.src.token_text(start, self.pos);
+                SyntaxKind::from_keyword(&spelling).unwrap_or(IDENT)
             }
             '(' => L_PAREN,
             ')' => R_PAREN,
@@ -289,7 +456,13 @@ impl Lexer<'_> {
     }
 
     /// 普通字符串 / 字符字面量：遇到行尾仍未闭合则报错并在行尾截断。
+    /// javac 拒绝空字符字面量（`''`，包括 `'\u0027'` 翻译出来的形态）。
     fn quoted(&mut self, start: usize, quote: char, message: &'static str) {
+        if quote == '\'' && self.peek() == Some('\'') {
+            self.error(start, "空字符字面量");
+            self.bump();
+            return;
+        }
         loop {
             match self.peek() {
                 None | Some('\n') | Some('\r') => {
@@ -323,8 +496,10 @@ impl Lexer<'_> {
                     self.bump();
                     self.bump();
                 }
-                Some('"') if self.rest().starts_with("\"\"\"") => {
-                    self.pos += 3;
+                Some('"') if self.peek_nth(1) == Some('"') && self.peek_nth(2) == Some('"') => {
+                    self.bump();
+                    self.bump();
+                    self.bump();
                     break;
                 }
                 Some(_) => {
@@ -511,5 +686,120 @@ mod tests {
     fn unterminated_string_reports_error() {
         let (_, errors) = tokenize("\"abc\nint");
         assert_eq!(errors.len(), 1);
+    }
+
+    /// JLS 3.3：`\u0020` 是空格，在分词之前就应该翻译掉。
+    #[test]
+    fn unicode_escape_between_tokens_is_translated() {
+        let (tokens, errors) = tokenize("class A { int\\u0020x = 1; }");
+        assert!(errors.is_empty(), "{errors:?}");
+        let kinds: Vec<_> = tokens
+            .into_iter()
+            .map(|t| t.kind)
+            .filter(|k| !k.is_trivia())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                CLASS_KW,
+                IDENT,
+                L_CURLY,
+                INT_KW,
+                IDENT,
+                EQ,
+                INT_LITERAL,
+                SEMICOLON,
+                R_CURLY,
+            ]
+        );
+    }
+
+    /// 两个 `\u002f` 拼成 `//`：这一行在 javac 眼里是注释。
+    #[test]
+    fn unicode_escapes_can_form_a_comment_marker() {
+        let text = "class A {\n\\u002f\\u002f comment\n int y = 2;\n}";
+        let (tokens, errors) = tokenize(text);
+        assert!(errors.is_empty(), "{errors:?}");
+        let total: u32 = tokens.iter().map(|t| t.len).sum();
+        assert_eq!(total as usize, text.len());
+        let kinds: Vec<_> = tokens
+            .into_iter()
+            .map(|t| t.kind)
+            .filter(|k| *k != WHITESPACE)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                CLASS_KW,
+                IDENT,
+                L_CURLY,
+                LINE_COMMENT,
+                INT_KW,
+                IDENT,
+                EQ,
+                INT_LITERAL,
+                SEMICOLON,
+                R_CURLY,
+            ]
+        );
+    }
+
+    /// `\u000A` 是行终止符：注释在它那里结束，后面是真正的代码。
+    #[test]
+    fn unicode_newline_terminates_a_line_comment() {
+        let (_, errors) = tokenize("// \\u000A int x;");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            kinds("// \\u000A int x;"),
+            vec![INT_KW, IDENT, SEMICOLON]
+        );
+    }
+
+    /// 资格规则：`\u` 前面紧挨着偶数个 `\` 时才翻译。
+    #[test]
+    fn unicode_escape_eligibility_counts_backslashes() {
+        // `\\u0041`：偶数个，不翻译——两个 `\` 都是错误字符，`u0041` 是标识符
+        let (tokens, errors) = tokenize("\\\\u0041");
+        assert_eq!(errors.len(), 2);
+        let kinds: Vec<_> = tokens.into_iter().map(|t| t.kind).collect();
+        assert_eq!(kinds, vec![ERROR_TOKEN, ERROR_TOKEN, IDENT]);
+        // `\\\u0041`：奇数个，最后一个 `\` 合格——仍是两个 `\` 错误字符，但转义变成了 `A`
+        let (tokens, errors) = tokenize("\\\\\\u0041");
+        assert_eq!(errors.len(), 2);
+        let kinds: Vec<_> = tokens.into_iter().map(|t| t.kind).collect();
+        assert_eq!(kinds, vec![ERROR_TOKEN, ERROR_TOKEN, IDENT]);
+    }
+
+    /// 关键字也能由转义拼出来：`cl\u0061ss` 就是 `class`。
+    #[test]
+    fn unicode_escape_can_spell_a_keyword() {
+        let (tokens, errors) = tokenize("cl\\u0061ss A {}");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(tokens[0].kind, CLASS_KW);
+        assert_eq!(tokens[0].len, 10);
+    }
+
+    /// javac 拒绝 `'\u0027'`（翻译后是 `'''`，空字符字面量）。
+    #[test]
+    fn unicode_quote_escape_is_an_empty_char_literal() {
+        let (_, errors) = tokenize("'\\u0027'");
+        assert!(!errors.is_empty(), "空字符字面量应当报错");
+    }
+
+    /// 普通 `''` 也是 javac 拒绝的空字符字面量。
+    #[test]
+    fn empty_char_literal_reports_error() {
+        let (_, errors) = tokenize("''");
+        assert_eq!(errors.len(), 1);
+    }
+
+    /// 翻译视图里 token 的长度必须仍是原始字节数，且总和覆盖整个文件。
+    #[test]
+    fn translated_lengths_cover_whole_input() {
+        let text = "class A { int\\u0020x = 1; } // \\u000A int y;";
+        let (tokens, errors) = tokenize(text);
+        assert!(errors.is_empty(), "{errors:?}");
+        let total: u32 = tokens.iter().map(|t| t.len).sum();
+        assert_eq!(total as usize, text.len());
     }
 }
