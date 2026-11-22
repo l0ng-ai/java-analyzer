@@ -1826,6 +1826,34 @@ mod tests {
             .collect()
     }
 
+    /// 注释里的 `\u000A`（JLS 3.3 在分词前翻译）结束注释：后面的
+    /// `int x = 1;` 是真代码，javac 能编译，不该报 Cannot resolve symbol。
+    #[test]
+    fn unicode_newline_in_comment_reveals_the_declaration() {
+        let diags = check(
+            r#"
+class Main {
+    int use() {
+        // \u000A int x = 1;
+        return x;
+    }
+}
+"#,
+        );
+        let unresolved: Vec<_> = diags
+            .iter()
+            .filter(|(code, _)| {
+                matches!(
+                    code,
+                    DiagnosticCode::UnresolvedName
+                        | DiagnosticCode::UnresolvedField
+                        | DiagnosticCode::UnresolvedMethod
+                )
+            })
+            .collect();
+        assert!(unresolved.is_empty(), "{diags:?}");
+    }
+
     #[test]
     fn annotations_outside_their_target() {
         let diags = check(

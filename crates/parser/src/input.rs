@@ -59,7 +59,16 @@ impl Input {
                     input.was_joint();
                 }
                 let contextual = if token.kind == SyntaxKind::IDENT {
-                    SyntaxKind::from_contextual_keyword(&text[offset..end]).unwrap_or(token.kind)
+                    // token 文本里的 `\uXXXX`（JLS 3.3）翻译之后再认上下文关键字
+                    let raw = &text[offset..end];
+                    let spelling;
+                    let kind_text = if raw.contains('\\') {
+                        spelling = crate::lexer::translate_span(raw);
+                        &spelling
+                    } else {
+                        raw
+                    };
+                    SyntaxKind::from_contextual_keyword(kind_text).unwrap_or(token.kind)
                 } else {
                     token.kind
                 };
