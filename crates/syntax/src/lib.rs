@@ -627,7 +627,8 @@ class A {
         assert!(parse.errors().is_empty(), "{:#?}", parse.errors());
 
         // 2. 转义拼出注释起点：整行在 javac 眼里是注释
-        let text = "class UnicodeCommentStart {\n\\u002f\\u002f javac sees a comment\n    int y = 2;\n}\n";
+        let text =
+            "class UnicodeCommentStart {\n\\u002f\\u002f javac sees a comment\n    int y = 2;\n}\n";
         let parse = CompilationUnit::parse(text);
         assert_eq!(parse.syntax_node().text().to_string(), text);
         assert!(parse.errors().is_empty(), "{:#?}", parse.errors());
