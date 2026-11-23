@@ -95,28 +95,29 @@ fn translate_into(text: &str, chars: &mut Vec<char>, raw: &mut Vec<u32>) {
             }
             let n = i - run;
             // 只有串长为奇数（最后一个 `\` 前面有偶数个 `\`）且后面紧跟
-            // `u` + 4 个十六进制位时，最后一个 `\` 才开启一个合格的转义
+            // 一个或多个 `u`（`\uu0041` 也合法）+ 4 个十六进制位时，最后一个 `\` 才开启一个合格的转义
+            let hex_start = i + bytes[i..].iter().take_while(|&&b| b == b'u').count();
             let eligible = n % 2 == 1
-                && bytes.get(i) == Some(&b'u')
+                && hex_start > i
                 && bytes
-                    .get(i + 1..i + 5)
+                    .get(hex_start..hex_start + 4)
                     .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit));
             if eligible {
-                let code = u32::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 5]).unwrap(), 16)
-                    .unwrap();
+                let hex = std::str::from_utf8(&bytes[hex_start..hex_start + 4]).unwrap();
+                let code = u32::from_str_radix(hex, 16).unwrap();
                 if let Some(ch) = char::from_u32(code) {
                     for _ in 0..n - 1 {
                         chars.push('\\');
                         raw.push(1);
                     }
                     chars.push(ch);
-                    raw.push(6);
-                    // `i` 停在 `u` 上：转义还剩 `u` + 4 个十六进制位共 5 个字节
-                    i += 5;
+                    // 转义占的原始字节：`\`、所有的 `u` 和 4 个十六进制位
+                    raw.push((hex_start + 4 - i + 1) as u32);
+                    i = hex_start + 4;
                     continue;
                 }
-                // 代理区单独成转义：javac 也拒绝（illegal unicode escape）。
-                // 不翻译，让 `\` 在代码位置自然产出错误诊断。
+                // 代理区的码点单独成不了 `char`：保留原文。字符和字符串字面量里
+                // （`'\uD800'`、`"\uD83D\uDE00"`）照旧按转义序列跳过，在代码位置则报错误字符。
             }
             for _ in 0..n {
                 chars.push('\\');
@@ -749,10 +750,7 @@ mod tests {
     fn unicode_newline_terminates_a_line_comment() {
         let (_, errors) = tokenize("// \\u000A int x;");
         assert!(errors.is_empty(), "{errors:?}");
-        assert_eq!(
-            kinds("// \\u000A int x;"),
-            vec![INT_KW, IDENT, SEMICOLON]
-        );
+        assert_eq!(kinds("// \\u000A int x;"), vec![INT_KW, IDENT, SEMICOLON]);
     }
 
     /// 资格规则：`\u` 前面紧挨着偶数个 `\` 时才翻译。
@@ -768,6 +766,20 @@ mod tests {
         assert_eq!(errors.len(), 2);
         let kinds: Vec<_> = tokens.into_iter().map(|t| t.kind).collect();
         assert_eq!(kinds, vec![ERROR_TOKEN, ERROR_TOKEN, IDENT]);
+    }
+
+    /// `\u` 后面可以跟多个 `u`：`\uuu0020` 同样是空格。
+    #[test]
+    fn unicode_escape_may_repeat_the_u() {
+        let text = "int\\uuu0020x";
+        let (tokens, errors) = tokenize(text);
+        assert!(errors.is_empty(), "{errors:?}");
+        let kinds: Vec<_> = tokens.iter().map(|t| t.kind).collect();
+        assert_eq!(kinds, vec![INT_KW, WHITESPACE, IDENT]);
+        assert_eq!(tokens[1].len, 8);
+        // 只有 `u` 没有十六进制位：不是转义
+        let (_, errors) = tokenize("int\\uu x");
+        assert!(!errors.is_empty());
     }
 
     /// 关键字也能由转义拼出来：`cl\u0061ss` 就是 `class`。
