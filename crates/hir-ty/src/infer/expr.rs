@@ -1853,7 +1853,8 @@ impl InferCtx<'_> {
                     let target = call.param_ty(idx);
                     let mut produced = self.infer_method_ref(method_ref, Some(&target));
                     if method_ref.is_constructor() {
-                        produced = self.parameterize_constructor_ref(&call, idx, produced);
+                        produced =
+                            self.parameterize_constructor_ref(&call, idx, produced, method_ref);
                         // 构造器引用的函数类型形参也被选定构造器的形参约束：
                         // `Func<X, Scalar<Y>>` 收 `IsBlank::new`（唯一构造器 `IsBlank(Textish)`）
                         // 时 `X := Textish`——javac 由方法引用的编译期声明得出同样的约束。
@@ -1866,8 +1867,12 @@ impl InferCtx<'_> {
                             let chosen_params = method_sig(db, *chosen).params.clone();
                             if let Some((inputs, _)) = self.functional_sig(&target) {
                                 if inputs.len() == chosen_params.len() {
+                                    // 泛型类的构造器形参（`Box(T v)`）里的 `T` 属于被引用的类，
+                                    // 不能拿来绑定这次调用的类型参数
                                     for (input, param) in inputs.iter().zip(chosen_params.iter()) {
-                                        call.inference.unify(db, input, param);
+                                        if !mentions_type_param(param) {
+                                            call.inference.unify(db, input, param);
+                                        }
                                     }
                                 }
                             }
@@ -1913,7 +1918,8 @@ impl InferCtx<'_> {
                 let Some(class) = class else {
                     continue;
                 };
-                let produced = self.parameterize_constructor_ref(&call, idx, Ty::class(class));
+                let produced =
+                    self.parameterize_constructor_ref(&call, idx, Ty::class(class), method_ref);
                 if produced.type_args().is_empty() || produced.contains_unknown() {
                     continue;
                 }
@@ -2117,7 +2123,13 @@ impl InferCtx<'_> {
 
     /// 泛型类的构造器引用（`TreeMap::new`）没写类型实参：按函数类型的返回类型（或者它是待推断的
     /// 类型参数时按它的上界）推出被构造类的类型实参，像菱形一样。
-    fn parameterize_constructor_ref(&self, call: &Call, idx: usize, produced: Ty) -> Ty {
+    fn parameterize_constructor_ref(
+        &self,
+        call: &Call,
+        idx: usize,
+        produced: Ty,
+        method_ref: &ast::MethodRef,
+    ) -> Ty {
         let db = self.db;
         let Ty::Class(class, args) = &produced else {
             return produced;
@@ -2142,21 +2154,43 @@ impl InferCtx<'_> {
             }
             other => other.subst(&call.inference.bindings),
         };
+        // 返回类型是这次调用还没定的类型参数时只能拿它的上界来约束；没有上界就不约束
         let wanted = match &ret {
             Ty::TypeParam(param) if call.inference.owners.contains(&param.owner) => {
-                match crate::lower::type_param_bounds(db, *param).first() {
-                    Some(bound) => bound
-                        .subst(&call.receiver_subst)
-                        .subst(&call.inference.bindings),
-                    None => return produced,
-                }
+                crate::lower::type_param_bounds(db, *param)
+                    .first()
+                    .map(|bound| {
+                        bound
+                            .subst(&call.receiver_subst)
+                            .subst(&call.inference.bindings)
+                    })
             }
-            other => other.clone(),
+            other => Some(other.clone()),
         };
         let class_owner = GenericOwner::Class(*class);
         let generic = this_ty(db, *class);
         let mut inference = crate::method_resolution::Inference::new(vec![class_owner]);
-        inference.unify_with_expected(db, &generic, &wanted);
+        if let Some(wanted) = &wanted {
+            inference.unify_with_expected(db, &generic, wanted);
+        }
+        // 函数类型的形参也约束类的类型参数：`apply(Box::new, "x")` 里 `Function<String, B>`
+        // 收 `Box(T v)` 得出 `T := String`。返回类型还是没定的 `B` 时，只看它推不出来
+        if let Some(Resolution::Method(chosen)) = self
+            .result
+            .resolutions
+            .get(&method_ref.syntax().text_range())
+        {
+            let params = &method_sig(db, *chosen).params;
+            if let Some((inputs, _)) = self.functional_sig(&call.param_ty(idx)) {
+                if inputs.len() == params.len() {
+                    for (param, input) in params.iter().zip(&inputs) {
+                        if !input.contains_unknown() && !mentions_type_param(input) {
+                            inference.unify(db, param, input);
+                        }
+                    }
+                }
+            }
+        }
         // 推不出来的类型实参留作未知（之后还可以改写），一个都推不出来时保持原样
         let res = generic
             .subst(&inference.bindings)

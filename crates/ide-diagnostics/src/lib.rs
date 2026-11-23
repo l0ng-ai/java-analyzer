@@ -1974,6 +1974,40 @@ public class Main {
         assert!(bad.is_empty(), "{diags:?}");
     }
 
+    /// 泛型类的构造器引用作实参、调用结果又没有目标类型时，类的类型实参由函数类型的形参推出：
+    /// `apply(Box::new, "x")` 是 `Box<String>`，不是原始的 `Box`。
+    #[test]
+    fn generic_constructor_refs_take_type_args_from_functional_inputs() {
+        let diags = check(
+            r#"
+interface Function<A, B> { B apply(A a); }
+interface BiFunction<A, B, C> { C apply(A a, B b); }
+class Box<T> { T v; Box(T v) { this.v = v; } T get() { return v; } }
+class Pair<K, V> {
+    K k; V v;
+    Pair(K k, V v) { this.k = k; this.v = v; }
+    K key() { return k; }
+    V value() { return v; }
+}
+public class Main {
+    static <A, B> B apply(Function<A, B> f, A a) { return f.apply(a); }
+    static <A, B, C> C apply2(BiFunction<A, B, C> f, A a, B b) { return f.apply(a, b); }
+    void m() {
+        String w = apply(Box::new, "x").get().trim();
+        int q = apply2(Pair::new, "a", 1).value().intValue();
+        String r = apply2(Pair::new, "a", 1).key().trim();
+    }
+}
+"#,
+        );
+        assert!(
+            !diags
+                .iter()
+                .any(|(code, _)| *code == DiagnosticCode::UnresolvedMethod),
+            "{diags:?}"
+        );
+    }
+
     #[test]
     fn annotations_outside_their_target() {
         let diags = check(
