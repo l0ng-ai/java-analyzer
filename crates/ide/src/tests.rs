@@ -1685,3 +1685,81 @@ fn goto_definition_in_annotation_values() {
         );
     }
 }
+
+/// 光标处构造调用跳到的构造器声明的开头。
+fn constructor_target(text: &str) -> String {
+    let fx = fixture(text);
+    let result = navigation::goto_definition(&fx.db, position(&fx)).unwrap();
+    assert_eq!(result.info.len(), 1);
+    let nav = &result.info[0];
+    let full = slice(&fx, &nav.file, nav.full_range);
+    full.split(')').next().unwrap().to_owned() + ")"
+}
+
+/// 菱形构造在 `Box(T)` 和更具体的 `Box(CharSequence)` 之间按 JLS 15.12.2.5 选后者，
+/// 和声明顺序无关；显式给出类型实参时 `T` 已经定下来，照常比较代换后的形参。
+#[test]
+fn diamond_constructor_picks_the_most_specific_overload() {
+    let generic_first = r#"
+class Main {
+    static class Box<T> {
+        Box(T value) {}
+        Box(CharSequence value) {}
+    }
+    void f() { new Bo$0x<>("s"); }
+}
+"#;
+    assert_eq!(constructor_target(generic_first), "Box(CharSequence value)");
+    let concrete_first = r#"
+class Main {
+    static class Box<T> {
+        Box(CharSequence value) {}
+        Box(T value) {}
+    }
+    void f() { new Bo$0x<>("s"); }
+}
+"#;
+    assert_eq!(
+        constructor_target(concrete_first),
+        "Box(CharSequence value)"
+    );
+
+    // 实参是形参类型的子类型
+    let subtype = r#"
+class Main {
+    static class Base {}
+    static class Sub extends Base {}
+    static class G<T> {
+        G(T value) {}
+        G(Base value) {}
+    }
+    void f(Sub s) { new $0G<>(s); }
+}
+"#;
+    assert_eq!(constructor_target(subtype), "G(Base value)");
+
+    // 显式类型实参：`Box<String>` 时 `Box(T)` 是 `Box(String)`，更具体
+    let explicit_string = r#"
+class Main {
+    static class Box<T> {
+        Box(T value) {}
+        Box(CharSequence value) {}
+    }
+    void f() { new Bo$0x<String>("s"); }
+}
+"#;
+    assert_eq!(constructor_target(explicit_string), "Box(T value)");
+    let explicit_object = r#"
+class Main {
+    static class Box<T> {
+        Box(T value) {}
+        Box(CharSequence value) {}
+    }
+    void f() { new Bo$0x<Object>("s"); }
+}
+"#;
+    assert_eq!(
+        constructor_target(explicit_object),
+        "Box(CharSequence value)"
+    );
+}

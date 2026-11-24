@@ -2758,4 +2758,36 @@ class Main {
         );
         assert!(errors.is_empty(), "{errors:#?}");
     }
+
+    /// 菱形构造选中 `Req(MV<String, String>, ...)` 而不是 `Req(T, ...)`：`T` 由目标类型定成
+    /// `Void`，不能按 `T = H` 报类型不匹配。javac 编译无警告。
+    #[test]
+    fn diamond_overload_choice_does_not_fix_the_type_argument() {
+        let diags = check(
+            r#"
+import java.util.HashMap;
+
+public class Main {
+    interface MV<K, V> extends java.util.Map<K, V> {}
+
+    static class H extends HashMap<String, String> implements MV<String, String> {}
+
+    static class Req<T> {
+        Req(T body, String method, String url) {}
+        Req(MV<String, String> headers, String method, String url) {}
+    }
+
+    void f() {
+        H h = new H();
+        Req<Void> r = new Req<>(h, "GET", "u");
+    }
+}
+"#,
+        );
+        let mismatches: Vec<_> = diags
+            .iter()
+            .filter(|(code, _)| *code == DiagnosticCode::TypeMismatch)
+            .collect();
+        assert!(mismatches.is_empty(), "{diags:?}");
+    }
 }
