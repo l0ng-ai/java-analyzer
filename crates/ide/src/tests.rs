@@ -1763,3 +1763,63 @@ class Main {
         "Box(CharSequence value)"
     );
 }
+
+/// Lombok 字段和它生成的访问器算一组：从字段或者任一访问器的调用处查引用，
+/// 都列出字段的直接访问和全部访问器的调用点，setter 的调用算写入。
+#[test]
+fn references_of_lombok_field_include_accessor_calls() {
+    let files = |cursor_in_foo: bool| {
+        let (field, call) = if cursor_in_foo {
+            ("private String ti$0tle;", "foo.getTitle()")
+        } else {
+            ("private String title;", "foo.getTi$0tle()")
+        };
+        format!(
+            r#"
+//- /demo/Foo.java
+package demo;
+import lombok.Data;
+@Data
+public class Foo {{
+    {field}
+    private int count;
+    String raw() {{ return title; }}
+}}
+//- /demo/Bar.java
+package demo;
+public class Bar {{
+    public void run() {{
+        Foo foo = new Foo();
+        String t = {call};
+        foo.setTitle("x");
+        int c = foo.getCount();
+    }}
+}}
+"#
+        )
+    };
+    for cursor_in_foo in [true, false] {
+        let fx = fixture(&files(cursor_in_foo));
+        let foo = fx.file_by_path("/demo/Foo.java").file_id;
+        let refs = references::find_all_refs(&fx.db, position(&fx), true).unwrap();
+        let text = |file_id, range: TextRange| {
+            let source = base_db::source_file(&fx.db, file_id).unwrap();
+            source.text(&fx.db)[usize::from(range.start())..usize::from(range.end())].to_owned()
+        };
+        let found: Vec<(bool, String, bool)> = refs
+            .iter()
+            .filter(|r| !r.is_declaration)
+            .map(|r| (r.file_id == foo, text(r.file_id, r.range), r.is_write))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (true, "title".to_owned(), false),
+                (false, "getTitle".to_owned(), false),
+                (false, "setTitle".to_owned(), true),
+            ],
+            "{refs:?}"
+        );
+        assert_eq!(refs.iter().filter(|r| r.is_declaration).count(), 1);
+    }
+}

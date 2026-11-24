@@ -211,7 +211,7 @@ fn is_synthetic_method(db: &dyn Db, method: MethodId) -> bool {
 
 /// 合成的访问器（Lombok 的 getter / setter / wither / 构建器方法、记录的访问器）
 /// 是从哪个字段生成的、属于哪一种。
-fn accessor_origin(db: &dyn Db, method: MethodId) -> Option<(FieldId, AccessorKind)> {
+pub(crate) fn accessor_origin(db: &dyn Db, method: MethodId) -> Option<(FieldId, AccessorKind)> {
     let data = class_data(db, method.class)?;
     let m = data.methods.get(method.idx as usize)?;
     if m.is_constructor || !m.flags.contains(Modifiers::SYNTHETIC) {
@@ -247,7 +247,7 @@ fn accessor_origin(db: &dyn Db, method: MethodId) -> Option<(FieldId, AccessorKi
 }
 
 /// 字段的全部合成访问器（包括 Lombok 构建器类上的同名方法）。
-fn field_accessors(db: &dyn Db, field: FieldId) -> Vec<(MethodId, AccessorKind)> {
+pub(crate) fn field_accessors(db: &dyn Db, field: FieldId) -> Vec<(MethodId, AccessorKind)> {
     let Some(data) = class_data(db, field.class) else {
         return Vec::new();
     };

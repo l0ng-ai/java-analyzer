@@ -1,12 +1,13 @@
 //! 查找引用、文档内高亮。
 
 use base_db::Db;
-use hir::Definition;
+use hir::{AccessorKind, Definition};
 use ide_db::search::{find_references_with_docs, references_in_file, ReferenceKind};
 use syntax::TextRange;
 
 use crate::{
     navigation::{definition_at, position_file},
+    rename::{accessor_origin, field_accessors},
     FileId, FilePosition,
 };
 
@@ -46,15 +47,19 @@ pub(crate) fn find_all_refs(
         definition_at(db, file, name)
     })?;
 
-    let mut res: Vec<ReferenceItem> = find_references_with_docs(db, &def)
-        .into_iter()
-        .map(|reference| ReferenceItem {
-            file_id: reference.file_id,
-            range: reference.range,
-            is_write: reference.kind == ReferenceKind::Write,
-            is_declaration: false,
-        })
-        .collect();
+    let mut res: Vec<ReferenceItem> = Vec::new();
+    for (target, setter) in accessor_group(db, &def) {
+        res.extend(
+            find_references_with_docs(db, &target)
+                .into_iter()
+                .map(|reference| ReferenceItem {
+                    file_id: reference.file_id,
+                    range: reference.range,
+                    is_write: setter || reference.kind == ReferenceKind::Write,
+                    is_declaration: false,
+                }),
+        );
+    }
     // 服务端控制器方法：调用它的 HTTP 客户端方法（Feign / HTTP 接口）也算引用；
     // 反过来，客户端方法对应的服务端方法也列出来
     // Spring Bean（类或 `@Bean` 方法）：收到它的注入点也算引用
@@ -77,6 +82,26 @@ pub(crate) fn find_all_refs(
     res.sort_by_key(|item| (item.file_id, item.range.start()));
     res.dedup_by_key(|item| (item.file_id, item.range));
     Some(res)
+}
+
+/// 查引用时一起查的定义，以及它的调用是否算写入字段。
+///
+/// 字段和 Lombok 为它生成的访问器（getter / setter / wither、构建器方法）算一组：
+/// 从字段或者任一访问器出发，都列出字段的直接访问和全部访问器的调用点，setter 的调用算写入。
+fn accessor_group(db: &dyn Db, def: &Definition) -> Vec<(Definition, bool)> {
+    let field = match def {
+        Definition::Field(field) => Some(*field),
+        Definition::Method(method) => accessor_origin(db, *method).map(|(field, _)| field),
+        _ => None,
+    };
+    let Some(field) = field else {
+        return vec![(def.clone(), false)];
+    };
+    let mut res = vec![(Definition::Field(field), false)];
+    for (accessor, kind) in field_accessors(db, field) {
+        res.push((Definition::Method(accessor), kind == AccessorKind::Setter));
+    }
+    res
 }
 
 /// 当前文件里与光标下符号相同的所有出现位置。
