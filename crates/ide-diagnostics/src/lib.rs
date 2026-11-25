@@ -639,7 +639,8 @@ fn known_type_names(db: &dyn Db, file: SourceFile) -> Arc<FxHashSet<String>> {
     Arc::new(known)
 }
 
-/// 类型位置上解析不了的类型名：声明的类型、类型实参、`new`、强制转换、`throws`、`catch` 等。
+/// 类型位置上解析不了的类型名：声明的类型、类型实参、`new`、强制转换、`throws`、`catch`、
+/// 注解名等。
 ///
 /// 只报确定的：带限定符的名字只在限定符解析成已知的类（继承链完整）或已知的包时才报；
 /// 没有登记成类的匿名类里的名字只在能确定它不是父类型继承来的成员类型时才报
@@ -656,25 +657,35 @@ fn unresolved_types(view: &View<'_>, out: &mut Vec<Diagnostic>) {
     let mut resolved_hierarchy: FxHashMap<hir::ClassId, bool> = FxHashMap::default();
     let mut resolved_names: FxHashMap<(hir::TypeScope, hir::Name), bool> = FxHashMap::default();
     for node in view.nodes() {
-        let Some(class_ty) = ast::ClassType::cast(node.clone()) else {
+        let name_ref = if let Some(class_ty) = ast::ClassType::cast(node.clone()) {
+            if node
+                .parent()
+                .is_some_and(|p| p.kind() == SyntaxKind::CLASS_TYPE)
+            {
+                continue;
+            }
+            if class_ty.qualifier().is_some() {
+                let names = known
+                    .get_or_insert_with(|| known_type_names(db, file))
+                    .clone();
+                if let Some(diagnostic) =
+                    unresolved_qualified_type(db, sema, file, &class_ty, &names)
+                {
+                    out.push(diagnostic);
+                }
+                continue;
+            }
+            class_ty.name_ref()
+        } else if let Some(annotation) = ast::Annotation::cast(node.clone()) {
+            // 注解名是 `QualifiedName`，不是 `ClassType`：只查简单名 `@Foo`
+            annotation
+                .name()
+                .filter(|name| name.qualifier().is_none())
+                .and_then(|name| name.name_ref())
+        } else {
             continue;
         };
-        if node
-            .parent()
-            .is_some_and(|p| p.kind() == SyntaxKind::CLASS_TYPE)
-        {
-            continue;
-        }
-        if class_ty.qualifier().is_some() {
-            let names = known
-                .get_or_insert_with(|| known_type_names(db, file))
-                .clone();
-            if let Some(diagnostic) = unresolved_qualified_type(db, sema, file, &class_ty, &names) {
-                out.push(diagnostic);
-            }
-            continue;
-        }
-        let Some(name_ref) = class_ty.name_ref() else {
+        let Some(name_ref) = name_ref else {
             continue;
         };
         let name = name_ref.text();
@@ -2467,6 +2478,41 @@ class Main {
             .map(|(_, text)| text.as_str())
             .collect();
         assert_eq!(unresolved, ["Missing", "Nope"], "{diags:?}");
+    }
+
+    #[test]
+    fn unresolved_annotation_names() {
+        let diags = check(
+            r#"
+@EnableFeignClients
+class Main {
+    @interface Marker {}
+
+    @Marker
+    int marked;
+
+    @Override
+    public String toString() { return ""; }
+
+    @Missing
+    @Deprecated
+    void run(@Nope int x) {}
+
+    @no.such.Thing
+    int ok;
+}
+"#,
+        );
+        let unresolved: Vec<&str> = diags
+            .iter()
+            .filter(|(code, _)| *code == DiagnosticCode::UnresolvedType)
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(
+            unresolved,
+            ["EnableFeignClients", "Missing", "Nope"],
+            "{diags:?}"
+        );
     }
 
     /// 每个文件里错误级的诊断（提示和警告不算）。
