@@ -155,10 +155,13 @@ impl Definition {
             return self.library_doc_comment(db);
         };
         let root = base_db::parse(db, source.file).syntax_node();
+        // 没有初始值的字段（`int count;`）的 VARIABLE_DECLARATOR 和里面的 NAME 范围相同，
+        // 要跳过 NAME 才拿到声明节点
         let node = root
             .covering_element(source.full_range)
             .ancestors()
-            .find(|n| n.text_range() == source.full_range)?;
+            .filter(|n| n.text_range() == source.full_range)
+            .find(|n| n.kind() != syntax::SyntaxKind::NAME)?;
         // 字段的声明节点是 VARIABLE_DECLARATOR，文档注释挂在外层的 FIELD_DECL 上
         let doc_owner = if node.kind() == syntax::SyntaxKind::VARIABLE_DECLARATOR {
             node.parent()?

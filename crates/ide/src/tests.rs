@@ -208,6 +208,34 @@ class Circle implements Shape {
     assert_eq!(result.info.docs.as_deref(), Some("The area."));
 }
 
+/// 字段的文档注释挂在 FIELD_DECL 上：没有初始值、`final`、注解、数组、一行声明多个变量
+/// 和 Lombok 访问器都要找得到。
+#[test]
+fn hover_shows_field_docs_without_initializer() {
+    let cases = [
+        ("int count;", "this.cou$0nt"),
+        ("int count = 0;", "this.cou$0nt"),
+        ("final int count;", "this.cou$0nt"),
+        ("@Deprecated int count;", "this.cou$0nt"),
+        ("int[] count;", "this.cou$0nt"),
+        ("int other, count;", "this.cou$0nt"),
+        ("int count, other = 1;", "this.cou$0nt"),
+        ("@lombok.Getter int count;", "getCou$0nt()"),
+        ("@lombok.Setter int count;", "setCou$0nt(1)"),
+    ];
+    for (field, use_site) in cases {
+        let fx = fixture(&format!(
+            "class Main {{\n    /** Docs. */ {field}\n    Main() {{ count = 1; }}\n    void f() {{ Object o = {use_site}; }}\n}}\n"
+        ));
+        let result = hover::hover(&fx.db, position(&fx)).unwrap();
+        assert_eq!(
+            result.info.docs.as_deref(),
+            Some("Docs."),
+            "{field} / {use_site}"
+        );
+    }
+}
+
 #[test]
 fn signature_help_tracks_active_parameter() {
     let fx = fixture(
