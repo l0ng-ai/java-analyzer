@@ -533,7 +533,7 @@ pub(crate) fn types_in_scope(
         }
         // 外层类的成员类型和其它作用域里的类同档，靠使用次数区分
         nested_classes(acc, ctx, class, location, score::TYPE_IN_SCOPE + 2);
-        for sup in hir::all_supers(db, class) {
+        for sup in hir::all_supers(db, class).iter().copied() {
             nested_classes(acc, ctx, sup, location, score::TYPE_IN_SCOPE + 2);
         }
     }

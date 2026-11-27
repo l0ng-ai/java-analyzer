@@ -789,11 +789,11 @@ impl InheritedMethod {
 /// `implements Foo` 时 `Supplier<Optional<T>> get()` 的签名是 `Supplier get()`。
 fn raw_inherited_classes(db: &dyn Db, class: ClassId) -> rustc_hash::FxHashSet<ClassId> {
     let mut raw = rustc_hash::FxHashSet::default();
-    for current in std::iter::once(class).chain(hir::all_supers(db, class)) {
+    for current in std::iter::once(class).chain(hir::all_supers(db, class).iter().copied()) {
         for sup in hir::class_supertypes(db, current).iter() {
             if let Ty::Class(id, _) = sup {
                 if is_raw(db, sup) && raw.insert(*id) {
-                    raw.extend(hir::all_supers(db, *id));
+                    raw.extend(hir::all_supers(db, *id).iter().copied());
                 }
             }
         }
@@ -887,16 +887,15 @@ fn unimplemented_abstract_methods(
 ) -> Vec<String> {
     // 直接父类不是抽象类时，父类那条继承链上的抽象方法由父类负责（javac 也只在父类上报）。
     // 枚举常量的类体例外：枚举可以把抽象方法留给每个常量的类体实现
-    let settled_by_superclass: Vec<ClassId> = hir::direct_supers(db, class)
-        .iter()
-        .copied()
-        .filter(|sup| {
-            class_header(db, *sup).is_some_and(|d| {
-                !d.is_interface() && !d.flags.is_abstract() && d.kind != ClassKind::Enum
-            })
-        })
-        .flat_map(|sup| std::iter::once(sup).chain(hir::all_supers(db, sup)))
-        .collect();
+    let mut settled_by_superclass: Vec<ClassId> = Vec::new();
+    for sup in hir::direct_supers(db, class).iter().copied() {
+        if class_header(db, sup).is_some_and(|d| {
+            !d.is_interface() && !d.flags.is_abstract() && d.kind != ClassKind::Enum
+        }) {
+            settled_by_superclass.push(sup);
+            settled_by_superclass.extend(hir::all_supers(db, sup).iter().copied());
+        }
+    }
     // 继承链上任何地方有非抽象的、同名且形参类型覆写等价、返回类型兼容的方法，就认为实现了。
     // 同名的静态方法是另一种错误（静态方法不能隐藏实例方法），这里按"有实现"处理
     let implements = |concrete: &InheritedMethod, abstract_method: &InheritedMethod| {

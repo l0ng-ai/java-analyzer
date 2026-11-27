@@ -704,7 +704,15 @@ pub fn direct_supers(db: &dyn Db, id: ClassId) -> Arc<Vec<ClassId>> {
 }
 
 /// 所有祖先类型（不含自身），广度优先；`java.lang.Object` 总在其中（如果存在）。
-pub fn all_supers(db: &dyn Db, id: ClassId) -> Vec<ClassId> {
+/// 按类缓存：子类型判断、可访问性检查和各种"层次结构是否可靠"的判断都反复要同一个类的祖先。
+pub fn all_supers(db: &dyn Db, id: ClassId) -> Arc<Vec<ClassId>> {
+    all_supers_tracked(db, workspace(db), id)
+}
+
+// salsa 的追踪函数要求第一个参数是 salsa 结构体；键是普通值时借工作区单例占位，
+// 多参数的追踪函数会自动把参数驻留。
+#[salsa::tracked]
+fn all_supers_tracked(db: &dyn Db, _ws: base_db::Workspace, id: ClassId) -> Arc<Vec<ClassId>> {
     let mut res: Vec<ClassId> = Vec::new();
     let mut seen: FxHashSet<ClassId> = FxHashSet::default();
     seen.insert(id);
@@ -724,7 +732,7 @@ pub fn all_supers(db: &dyn Db, id: ClassId) -> Vec<ClassId> {
             res.push(object);
         }
     }
-    res
+    Arc::new(res)
 }
 
 /// 工作区源码类的"直接子类型"表：父类型 → 直接继承它的源码类。编辑方法体不会让它重算。

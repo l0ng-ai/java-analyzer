@@ -583,8 +583,18 @@ fn infer_diagnostics(view: &View<'_>, out: &mut Vec<Diagnostic>) {
 
 /// 类及其所有祖先是否都解析成功：只有这样，"继承来的成员类型里也没有"才是确定的。
 pub(crate) fn hierarchy_is_resolved(db: &dyn Db, class: hir::ClassId) -> bool {
+    hierarchy_is_resolved_tracked(db, base_db::workspace(db), class)
+}
+
+/// 按类缓存：每个方法调用、每个带类型实参的名字都要判断一次。
+#[salsa::tracked]
+fn hierarchy_is_resolved_tracked(
+    db: &dyn Db,
+    _ws: base_db::Workspace,
+    class: hir::ClassId,
+) -> bool {
     std::iter::once(class)
-        .chain(hir::all_supers(db, class))
+        .chain(hir::all_supers(db, class).iter().copied())
         .all(|c| {
             hir::class_header(db, c).is_some_and(|data| {
                 let declared = data.superclass.iter().count() + data.interfaces.len();

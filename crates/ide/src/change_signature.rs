@@ -1627,7 +1627,7 @@ fn old_family(db: &dyn Db, method: MethodId, name: &str, old_tys: &[Ty]) -> Vec<
     let mut res: Vec<MethodId> = Vec::new();
     let mut seen: FxHashSet<MethodId> = FxHashSet::default();
     seen.insert(method);
-    for sup in hir::all_supers(db, method.class) {
+    for sup in hir::all_supers(db, method.class).iter().copied() {
         let Some(data) = class_data(db, sup) else {
             continue;
         };

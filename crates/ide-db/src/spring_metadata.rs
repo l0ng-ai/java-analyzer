@@ -611,7 +611,7 @@ fn collect_class(
     stack.push(class);
     // 自己和父类（不含接口和 `Object`）
     let mut chain = vec![class];
-    chain.extend(hir::all_supers(db, class).into_iter().filter(|c| {
+    chain.extend(hir::all_supers(db, class).iter().copied().filter(|c| {
         hir::class_data(db, *c).is_some_and(|d| {
             !d.is_interface()
                 && d.binary_name != "java/lang/Object"

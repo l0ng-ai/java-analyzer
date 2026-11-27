@@ -450,7 +450,7 @@ pub fn is_environment(
             d.name.ends_with("Environment") || d.name.ends_with("PropertyResolver")
         })
     };
-    is_env(class) || hir::all_supers(db, class).into_iter().any(is_env)
+    is_env(class) || hir::all_supers(db, class).iter().copied().any(is_env)
 }
 
 /// 光标处引用的配置项：占位符（或 `getProperty` 的键）以及文件所在的模块。
