@@ -78,8 +78,12 @@ impl ModuleGraph {
     }
 }
 
-#[salsa::tracked]
 pub fn module_graph(db: &dyn Db) -> Arc<ModuleGraph> {
+    module_graph_tracked(db, workspace(db))
+}
+
+#[salsa::tracked]
+fn module_graph_tracked(db: &dyn Db, _ws: base_db::Workspace) -> Arc<ModuleGraph> {
     let mut graph = ModuleGraph::default();
     // 工作区里的模块声明优先
     let chunks = crate::index::workspace_class_names(db);

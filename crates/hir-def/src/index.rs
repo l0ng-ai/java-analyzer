@@ -40,10 +40,13 @@ pub fn item_tree_and_map(db: &dyn Db, file: SourceFile) -> (Arc<ItemTree>, Arc<S
     (Arc::new(tree), Arc::new(map))
 }
 
+// 没有参数的追踪函数，salsa 会把单元键驻留（intern），每次查询都要拿一次驻留表的分片锁；
+// 单元键的哈希值固定，所有线程的查询都落在同一把锁上，并行分析时互相等待。
+// 带上工作区单例作参数后，查询按它直接取键，不再经过驻留表。
 /// 工作区里的 `lombok.config`：`(所在目录, 文本)`，按目录排序。只读资源文件；结果不变时
 /// （改的是 Spring 配置文件）salsa 不会让下游失效。
 #[salsa::tracked(returns(ref))]
-fn lombok_config_files(db: &dyn Db) -> Vec<(SmolStr, Arc<str>)> {
+fn lombok_config_files(db: &dyn Db, _ws: base_db::Workspace) -> Vec<(SmolStr, Arc<str>)> {
     let mut files: Vec<(SmolStr, Arc<str>)> = workspace(db)
         .resources(db)
         .iter()
@@ -71,7 +74,7 @@ fn lombok_config_tracked(
     _ws: base_db::Workspace,
     dir: SmolStr,
 ) -> crate::lombok::LombokConfig {
-    let files = lombok_config_files(db);
+    let files = lombok_config_files(db, workspace(db));
     // 由近及远
     let mut chain: Vec<&(SmolStr, Arc<str>)> = files
         .iter()
@@ -224,7 +227,10 @@ const CHUNK_SIZE: usize = 128;
 
 /// 工作区源码文件（按文件号排序）和它们的角色。
 #[salsa::tracked]
-fn sorted_workspace_files(db: &dyn Db) -> Arc<Vec<(SourceFile, FileKind)>> {
+fn sorted_workspace_files(
+    db: &dyn Db,
+    _ws: base_db::Workspace,
+) -> Arc<Vec<(SourceFile, FileKind)>> {
     let files = workspace(db).files(db);
     Arc::new(
         files
@@ -237,7 +243,7 @@ fn sorted_workspace_files(db: &dyn Db) -> Arc<Vec<(SourceFile, FileKind)>> {
 
 #[salsa::tracked]
 fn item_tree_chunk(db: &dyn Db, _ws: base_db::Workspace, chunk: u32) -> Arc<ItemTreeChunk> {
-    let files = sorted_workspace_files(db);
+    let files = sorted_workspace_files(db, workspace(db));
     let start = chunk as usize * CHUNK_SIZE;
     let end = (start + CHUNK_SIZE).min(files.len());
     Arc::new(ItemTreeChunk {
@@ -257,7 +263,7 @@ fn item_tree_chunk(db: &dyn Db, _ws: base_db::Workspace, chunk: u32) -> Arc<Item
 /// 大工程里每次按键后的第一次查询因此不用把上万个文件的缓存挨个核对一遍。
 pub fn workspace_item_trees(db: &dyn Db) -> Vec<Arc<ItemTreeChunk>> {
     let ws = workspace(db);
-    let count = sorted_workspace_files(db).len().div_ceil(CHUNK_SIZE);
+    let count = sorted_workspace_files(db, ws).len().div_ceil(CHUNK_SIZE);
     (0..count as u32)
         .map(|chunk| item_tree_chunk(db, ws, chunk))
         .collect()
@@ -312,14 +318,18 @@ fn class_names_chunk(db: &dyn Db, ws: base_db::Workspace, chunk: u32) -> Arc<Cla
 /// 全部工作区源码文件的 [`FileClassNames`]，按文件号顺序分组。
 pub(crate) fn workspace_class_names(db: &dyn Db) -> Vec<Arc<ClassNamesChunk>> {
     let ws = workspace(db);
-    let count = sorted_workspace_files(db).len().div_ceil(CHUNK_SIZE);
+    let count = sorted_workspace_files(db, ws).len().div_ceil(CHUNK_SIZE);
     (0..count as u32)
         .map(|chunk| class_names_chunk(db, ws, chunk))
         .collect()
 }
 
-#[salsa::tracked]
 pub fn source_class_index(db: &dyn Db) -> Arc<SourceClassIndex> {
+    source_class_index_tracked(db, workspace(db))
+}
+
+#[salsa::tracked]
+fn source_class_index_tracked(db: &dyn Db, _ws: base_db::Workspace) -> Arc<SourceClassIndex> {
     let mut index = SourceClassIndex::default();
     let chunks = workspace_class_names(db);
     let files = chunks.iter().flat_map(|chunk| chunk.files.iter());
@@ -718,8 +728,15 @@ pub fn all_supers(db: &dyn Db, id: ClassId) -> Vec<ClassId> {
 }
 
 /// 工作区源码类的"直接子类型"表：父类型 → 直接继承它的源码类。编辑方法体不会让它重算。
-#[salsa::tracked]
 pub fn source_direct_subtypes(db: &dyn Db) -> Arc<FxHashMap<ClassId, Vec<ClassId>>> {
+    source_direct_subtypes_tracked(db, workspace(db))
+}
+
+#[salsa::tracked]
+fn source_direct_subtypes_tracked(
+    db: &dyn Db,
+    _ws: base_db::Workspace,
+) -> Arc<FxHashMap<ClassId, Vec<ClassId>>> {
     let mut map: FxHashMap<ClassId, Vec<ClassId>> = FxHashMap::default();
     let index = source_class_index(db);
     let mut names: Vec<&SmolStr> = index.iter().map(|(name, _, _)| name).collect();
