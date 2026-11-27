@@ -1865,6 +1865,59 @@ class Main {
         assert!(unresolved.is_empty(), "{diags:?}");
     }
 
+    /// 实参是 lambda / 方法引用时，只有与它潜在兼容的重载参与选择（JLS 15.12.2.1）：
+    /// lambda 看形参个数和体的形状（`s -> { return s; }`、`() -> "x"` 只与有返回值的函数类型兼容，
+    /// `s -> {}` 只与 void 的兼容），方法引用看有没有候选方法匹配函数类型的形参个数。
+    /// 先声明的重载都不兼容；选错了返回类型对不上。javac 编译无错误。
+    #[test]
+    fn functional_arg_shape_rules_out_overloads() {
+        let diags = check(
+            r#"
+interface Consumer<T> { void accept(T t); }
+interface Function<T, R> { R apply(T t); }
+interface BiFunction<T, U, R> { R apply(T t, U u); }
+interface Supplier<T> { T get(); }
+interface Runnable { void run(); }
+interface Callable<V> { V call() throws Exception; }
+public class Main {
+    static class Box { Box(String s) {} }
+    static int helper(String s) { return 0; }
+    int inst(String s) { return 0; }
+    static String m(Consumer<String> c) { return "c"; }
+    static int m(Function<String, String> f) { return 1; }
+    static String r(Runnable r) { return "r"; }
+    static int r(Callable<String> c) { return 2; }
+    static String a(BiFunction<String, String, Integer> p) { return "a"; }
+    static int a(Function<String, Integer> p) { return 3; }
+    static String k(Supplier<Object> p) { return "k"; }
+    static int k(Function<String, Object> p) { return 4; }
+    void use() {
+        String a1 = m(s -> {});
+        int b = m(s -> { return s; });
+        int c = r(() -> "x");
+        String d = r(() -> {});
+        int f = r(() -> { return "y"; });
+        int g = a(Main::helper);
+        int h = a(this::inst);
+        int i = k(Box::new);
+    }
+}
+"#,
+        );
+        let wrong: Vec<_> = diags
+            .iter()
+            .filter(|(code, _)| {
+                matches!(
+                    code,
+                    DiagnosticCode::TypeMismatch
+                        | DiagnosticCode::ArgumentMismatch
+                        | DiagnosticCode::AmbiguousCall
+                )
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{diags:?}");
+    }
+
     /// 两个同参数个数的泛型构造器竞争、实参里夹着多态表达式（菱形构造）时，
     /// lambda 形参的类型要来自幸存候选解出来的签名，而不是第一个实参的类型。
     /// javac 编译无警告（JLS 18.5.2 / 18.5.4）。
