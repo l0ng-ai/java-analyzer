@@ -548,3 +548,64 @@ impl<'a> Incompatibility<'a> {
         }
     }
 }
+
+/// 几个类型的最小上界（JLS §4.10.4），只在结果确定是单个类型时给出：其中一个是其余所有的
+/// 父类型，或者擦除后的公共父类型里只有一个最具体的、并且它不是泛型类（不用推类型实参）。
+/// 结果是交集类型、继承链不全、有未知类型时返回 `Unknown`。
+pub fn lub(db: &dyn Db, tys: &[Ty]) -> Ty {
+    if tys.is_empty() || tys.iter().any(Ty::contains_unknown) {
+        return Ty::Unknown;
+    }
+    if let Some(top) = tys
+        .iter()
+        .find(|top| tys.iter().all(|ty| is_subtype(db, ty, top)))
+    {
+        return top.clone();
+    }
+    let mut classes = Vec::with_capacity(tys.len());
+    for ty in tys {
+        let Ty::Class(class, _) = ty else {
+            return Ty::Unknown;
+        };
+        classes.push(*class);
+    }
+    let with_supers = |class: ClassId| {
+        let mut res = hir_def::all_supers(db, class);
+        res.push(class);
+        res
+    };
+    // 继承链上有解析不了的父类型时，公共父类型可能少算
+    let resolved = |class: ClassId| {
+        hir_def::class_header(db, class).is_some_and(|data| {
+            data.superclass.iter().count() + data.interfaces.len()
+                == class_supertypes(db, class).len()
+        })
+    };
+    if !classes
+        .iter()
+        .all(|&class| with_supers(class).into_iter().all(resolved))
+    {
+        return Ty::Unknown;
+    }
+    let common: Vec<ClassId> = with_supers(classes[0])
+        .into_iter()
+        .filter(|&sup| {
+            classes
+                .iter()
+                .all(|&class| hir_def::is_subclass_of(db, class, sup))
+        })
+        .collect();
+    let mut minimal = common.iter().copied().filter(|&sup| {
+        !common
+            .iter()
+            .any(|&other| other != sup && hir_def::is_subclass_of(db, other, sup))
+    });
+    match (minimal.next(), minimal.next()) {
+        (Some(only), None)
+            if hir_def::class_header(db, only).is_some_and(|data| data.type_params.is_empty()) =>
+        {
+            Ty::class(only)
+        }
+        _ => Ty::Unknown,
+    }
+}
