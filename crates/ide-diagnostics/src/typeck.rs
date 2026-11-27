@@ -27,6 +27,9 @@ use syntax::{
 };
 
 use crate::{hierarchy_is_resolved, view::View, Diagnostic, DiagnosticCode, Severity};
+use ide_db::overrides::{
+    erase_if, is_raw, overridden_methods, raw_inherited_classes, same_ty, visibility_rank,
+};
 
 fn error(range: TextRange, code: DiagnosticCode, message: String) -> Diagnostic {
     Diagnostic {
@@ -784,23 +787,6 @@ impl InheritedMethod {
     }
 }
 
-/// 经由原始类型继承来的父类型：某个父类型（或类自己）把它、或它的某个子类型写成了原始类型。
-/// 原始类型的成员签名和它的父类型都要擦除（JLS §4.8），不能把类型参数换成 `Object` 了事：
-/// `implements Foo` 时 `Supplier<Optional<T>> get()` 的签名是 `Supplier get()`。
-fn raw_inherited_classes(db: &dyn Db, class: ClassId) -> rustc_hash::FxHashSet<ClassId> {
-    let mut raw = rustc_hash::FxHashSet::default();
-    for current in std::iter::once(class).chain(hir::all_supers(db, class)) {
-        for sup in hir::class_supertypes(db, current).iter() {
-            if let Ty::Class(id, _) = sup {
-                if is_raw(db, sup) && raw.insert(*id) {
-                    raw.extend(hir::all_supers(db, *id));
-                }
-            }
-        }
-    }
-    raw
-}
-
 /// 类和它所有父类型（广度优先，自己在最前）里声明的方法（不含构造器）。父类型解析不全、
 /// 用了 Lombok 时返回 `None`。
 fn inherited_methods(db: &dyn Db, class: ClassId) -> Option<Vec<InheritedMethod>> {
@@ -862,14 +848,6 @@ fn erased_param_keys(db: &dyn Db, method: MethodId, subst: &Subst) -> Vec<Option
             Some(erased.display_qualified(db))
         })
         .collect()
-}
-
-fn erase_if(db: &dyn Db, ty: Ty, erase: bool) -> Ty {
-    if erase {
-        ty.erasure(db)
-    } else {
-        ty
-    }
 }
 
 fn param_keys_match(a: &[Option<String>], b: &[Option<String>]) -> bool {
@@ -988,15 +966,6 @@ fn inherited_implementation_problem(
     None
 }
 
-fn visibility_rank(visibility: Visibility) -> u8 {
-    match visibility {
-        Visibility::Private => 0,
-        Visibility::Package => 1,
-        Visibility::Protected => 2,
-        Visibility::Public => 3,
-    }
-}
-
 /// 类型里不含类型参数、通配符和未知部分，可以直接比较。
 fn is_plain(db: &dyn Db, ty: &Ty) -> bool {
     match ty {
@@ -1005,25 +974,6 @@ fn is_plain(db: &dyn Db, ty: &Ty) -> bool {
             args.is_empty() && class_header(db, *class).is_some_and(|d| d.type_params.is_empty())
         }
         Ty::Array(element) => is_plain(db, element),
-        _ => false,
-    }
-}
-
-/// 两个类型相同：结构相同，或者不含类型参数时全限定名相同（同名类的两份副本）。
-fn same_ty(db: &dyn Db, a: &Ty, b: &Ty) -> bool {
-    a == b
-        || (!a.mentions_params_where(&|_| true)
-            && !b.mentions_params_where(&|_| true)
-            && a.display_qualified(db) == b.display_qualified(db))
-}
-
-/// 类类型是原始类型（泛型类不带类型实参）。
-fn is_raw(db: &dyn Db, ty: &Ty) -> bool {
-    match ty {
-        Ty::Class(class, args) => {
-            args.is_empty() && class_header(db, *class).is_some_and(|d| !d.type_params.is_empty())
-        }
-        Ty::Array(element) => is_raw(db, element),
         _ => false,
     }
 }
@@ -1086,153 +1036,76 @@ fn override_checks(
     } else {
         visibility_rank(decl.flags.visibility())
     };
-    let own_generic = !decl.type_params.is_empty();
-    let raw = raw_inherited_classes(db, method.class);
-
-    for super_ty in all_super_tys(db, &hir::this_ty(db, method.class)) {
-        let Ty::Class(owner, args) = &super_ty else {
+    for overridden in overridden_methods(db, method).methods {
+        let candidate_id = overridden.method;
+        let (subst, erase, exact) = (overridden.subst, overridden.erase, overridden.exact);
+        let (Some(owner_data), Some(candidate)) = (
+            class_header(db, candidate_id.class),
+            hir::method_data(db, candidate_id),
+        ) else {
             continue;
         };
-        let owner = *owner;
-        if owner == method.class {
-            continue;
-        }
-        let erase = raw.contains(&owner);
-        let Some(owner_data) = class_data(db, owner) else {
-            continue;
+        let super_rank = if owner_data.is_interface() {
+            3
+        } else {
+            visibility_rank(candidate.flags.visibility())
         };
-        let class_subst = Subst::for_class(db, owner, args);
-        for (idx, candidate) in owner_data.methods.iter().enumerate() {
-            if candidate.is_constructor
-                || candidate.name != decl.name
-                || candidate.params.len() != decl.params.len()
-            {
-                continue;
-            }
-            // 泛型方法只和类型参数个数相同的泛型方法比较（类型参数按位置对应）；非泛型方法
-            // 可以靠擦除覆写泛型方法
-            if own_generic && candidate.type_params.len() != decl.type_params.len() {
-                continue;
-            }
-            let super_rank = if owner_data.is_interface() {
-                3
+        let super_sig = method_sig(db, candidate_id);
+        let owner_name = &owner_data.name;
+        if candidate.flags.is_static() != decl.flags.is_static() {
+            let message = if decl.flags.is_static() {
+                base_db::tr!(
+                    "静态方法 `{}` 不能隐藏 `{owner_name}` 里的实例方法",
+                    "Static method `{}` cannot hide the instance method in `{owner_name}`",
+                    decl.name
+                )
             } else {
-                visibility_rank(candidate.flags.visibility())
+                base_db::tr!(
+                    "实例方法 `{}` 不能覆写 `{owner_name}` 里的静态方法",
+                    "Instance method `{}` cannot override the static method in `{owner_name}`",
+                    decl.name
+                )
             };
-            // 接口的静态方法和私有方法不被继承
-            if owner_data.is_interface()
-                && (candidate.flags.is_static()
-                    || candidate.flags.visibility() == Visibility::Private)
-            {
-                continue;
-            }
-            // 私有方法不被继承；包私有的只在同一个包里才被继承
-            let same_package = {
-                let package = |name: &str| name.rsplit_once('/').map(|(p, _)| p.to_owned());
-                package(&owner_data.binary_name) == package(&data.binary_name)
-            };
-            if super_rank == 0 || (super_rank == 1 && !same_package) {
-                continue;
-            }
-            let candidate_id = MethodId {
-                class: owner,
-                idx: idx as u32,
-            };
-            let mut subst = class_subst.clone();
-            if own_generic {
-                for i in 0..decl.type_params.len() as u32 {
-                    subst.set(
-                        hir::TypeParamId {
-                            owner: GenericOwner::Method(candidate_id),
-                            idx: i,
-                        },
-                        Ty::TypeParam(hir::TypeParamId {
-                            owner: GenericOwner::Method(method),
-                            idx: i,
-                        }),
-                    );
-                }
-            }
-            let super_sig = method_sig(db, candidate_id);
-            let super_params: Vec<Ty> = super_sig
-                .params
-                .iter()
-                .map(|p| erase_if(db, p.subst(&subst), erase))
-                .collect();
-            if super_params.iter().any(Ty::contains_unknown) {
-                continue;
-            }
-            // 签名相同，或者（非泛型的）覆写方法的签名等于被覆写方法签名的擦除
-            let exact = sig
-                .params
-                .iter()
-                .zip(&super_params)
-                .all(|(own, sup)| same_ty(db, own, sup));
-            let by_erasure = !exact
-                && !own_generic
-                && sig.params.iter().zip(&super_params).all(|(own, sup)| {
-                    let erased = sup.erasure(db);
-                    !erased.contains_unknown() && same_ty(db, own, &erased)
-                });
-            if !exact && !by_erasure {
-                continue;
-            }
-            let owner_name = &owner_data.name;
-            if candidate.flags.is_static() != decl.flags.is_static() {
-                let message = if decl.flags.is_static() {
-                    base_db::tr!(
-                        "静态方法 `{}` 不能隐藏 `{owner_name}` 里的实例方法",
-                        "Static method `{}` cannot hide the instance method in `{owner_name}`",
-                        decl.name
-                    )
-                } else {
-                    base_db::tr!(
-                        "实例方法 `{}` 不能覆写 `{owner_name}` 里的静态方法",
-                        "Instance method `{}` cannot override the static method in `{owner_name}`",
-                        decl.name
-                    )
-                };
-                out.push(error(name_range, DiagnosticCode::InvalidOverride, message));
-                return;
-            }
-            if candidate.flags.contains(Modifiers::FINAL) {
-                out.push(error(
-                    name_range,
-                    DiagnosticCode::InvalidOverride,
-                    base_db::tr!(
-                        "不能覆写 `{owner_name}` 里的 final 方法 `{}`",
-                        "Cannot override final method `{}` in `{owner_name}`",
-                        decl.name
-                    ),
-                ));
-                return;
-            }
-            if own_rank < super_rank {
-                out.push(error(
-                    name_range,
-                    DiagnosticCode::InvalidOverride,
-                    base_db::tr!(
-                        "覆写 `{owner_name}.{}` 时不能收窄访问级别",
-                        "Cannot reduce the visibility when overriding `{owner_name}.{}`",
-                        decl.name
-                    ),
-                ));
-                return;
-            }
-            let super_ret = erase_if(db, super_sig.ret.subst(&subst), erase);
-            if !return_type_compatible(db, &sig.ret, &super_ret, exact) {
-                out.push(error(
-                    name_range,
-                    DiagnosticCode::InvalidOverride,
-                    base_db::tr!(
-                        "返回类型 `{}` 和被覆写的 `{owner_name}.{}` 的返回类型 `{}` 不兼容", "Return type `{}` is incompatible with overridden `{owner_name}.{}`, which returns `{}`",
-                        sig.ret.display(db),
-                        decl.name,
-                        super_ret.display(db)
-                    ),
-                ));
-                return;
-            }
+            out.push(error(name_range, DiagnosticCode::InvalidOverride, message));
+            return;
+        }
+        if candidate.flags.contains(Modifiers::FINAL) {
+            out.push(error(
+                name_range,
+                DiagnosticCode::InvalidOverride,
+                base_db::tr!(
+                    "不能覆写 `{owner_name}` 里的 final 方法 `{}`",
+                    "Cannot override final method `{}` in `{owner_name}`",
+                    decl.name
+                ),
+            ));
+            return;
+        }
+        if own_rank < super_rank {
+            out.push(error(
+                name_range,
+                DiagnosticCode::InvalidOverride,
+                base_db::tr!(
+                    "覆写 `{owner_name}.{}` 时不能收窄访问级别",
+                    "Cannot reduce the visibility when overriding `{owner_name}.{}`",
+                    decl.name
+                ),
+            ));
+            return;
+        }
+        let super_ret = erase_if(db, super_sig.ret.subst(&subst), erase);
+        if !return_type_compatible(db, &sig.ret, &super_ret, exact) {
+            out.push(error(
+                name_range,
+                DiagnosticCode::InvalidOverride,
+                base_db::tr!(
+                    "返回类型 `{}` 和被覆写的 `{owner_name}.{}` 的返回类型 `{}` 不兼容", "Return type `{}` is incompatible with overridden `{owner_name}.{}`, which returns `{}`",
+                    sig.ret.display(db),
+                    decl.name,
+                    super_ret.display(db)
+                ),
+            ));
+            return;
         }
     }
 }

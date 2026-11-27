@@ -545,6 +545,380 @@ class Main { double f(Shape s, Circle c) { return s.area() + c.area(); } }
 }
 
 #[test]
+fn rename_implementation_renames_sibling_implementations() {
+    let fx = fixture(
+        r#"
+//- /I.java
+interface I { String m(int a); }
+//- /X.java
+class X implements I { public String m$0(int a) { return "x"; } }
+//- /Y.java
+class Y implements I { public String m(int a) { return "y"; } }
+//- /Z.java
+abstract class Z implements I { }
+//- /W.java
+class W extends Z { public String m(int a) { return "w"; } }
+//- /Main.java
+class Main {
+    enum E implements I { A { public String m(int a) { return "a"; } } }
+    I anon = new I() { public String m(int a) { return "n"; } };
+    String f(Y y, W w) { return y.m(1) + w.m(2); }
+}
+"#,
+    );
+    let change = crate::rename::rename(&fx.db, position(&fx), "mm").unwrap();
+    let files = apply_change(&fx, &change);
+    assert_eq!(files.len(), 5, "{files:?}");
+    assert!(
+        files
+            .iter()
+            .all(|(_, text)| !text.contains(" m(") && !text.contains(".m(")),
+        "{files:?}"
+    );
+}
+
+/// 泛型父方法按子类看到的类型实参代换后才比较：`I<String>` 的 `m(T)` 是 `m(String)`，
+/// 同类里的 `m(Integer)` 只是重载，它和它的调用都不改；已有的 `mm(Integer)` 也不冲突。
+#[test]
+fn rename_override_of_generic_method_keeps_other_overloads() {
+    let src = r#"
+//- /I.java
+interface I<T> { String m(T t); }
+//- /X.java
+class X implements I<String> {
+    public String m$0(String s) { return "impl"; }
+    public String m(Integer i) { return "overload"; }
+    public String mm(Integer i) { return "existing"; }
+}
+//- /Main.java
+class Main { String f(I<String> i, X x) { return i.m("x") + x.m(1) + x.mm(1); } }
+"#;
+    let fx = fixture(src);
+    let change = crate::rename::rename(&fx.db, position(&fx), "mm").unwrap();
+    let files = apply_change(&fx, &change);
+    assert_eq!(
+        files,
+        [
+            ("/I.java".to_owned(), "interface I<T> { String mm(T t); }\n".to_owned()),
+            (
+                "/Main.java".to_owned(),
+                "class Main { String f(I<String> i, X x) { return i.mm(\"x\") + x.m(1) + x.mm(1); } }\n"
+                    .to_owned()
+            ),
+            (
+                "/X.java".to_owned(),
+                "class X implements I<String> {\n    public String mm(String s) { return \"impl\"; }\n    public String m(Integer i) { return \"overload\"; }\n    public String mm(Integer i) { return \"existing\"; }\n}\n"
+                    .to_owned()
+            ),
+        ]
+    );
+}
+
+/// 覆写族里别的成员所在的类已经有同签名的新名字方法：拒绝，而不是生成编译不过的修改。
+#[test]
+fn rename_override_rejects_conflict_in_sibling() {
+    let fx = fixture(
+        r#"
+//- /I.java
+interface I { String m(int a); }
+//- /X.java
+class X implements I { public String m$0(int a) { return "x"; } }
+//- /Y.java
+class Y implements I { public String m(int a) { return "y"; } public String mm(int a) { return "o"; } }
+"#,
+    );
+    assert!(crate::rename::rename(&fx.db, position(&fx), "mm").is_err());
+}
+
+/// 泛型方法的类型参数上界不同就不是覆写（JLS §8.4.4）：兄弟实现里这样的同名重载不跟着改；
+/// 上界相同的泛型覆写照常改名。
+#[test]
+fn rename_override_compares_method_type_param_bounds() {
+    let fx = fixture(
+        r#"
+//- /I.java
+interface I { <T extends Number> String m(T n); }
+//- /X.java
+class X implements I { public String m$0(Number n) { return "x"; } }
+//- /Y.java
+class Y implements I {
+    public <T extends Number> String m(T n) { return "y"; }
+    public <T extends CharSequence> String m(T s) { return "other"; }
+}
+"#,
+    );
+    let change = crate::rename::rename(&fx.db, position(&fx), "mm").unwrap();
+    let changed = apply_change(&fx, &change);
+    let y = &changed
+        .iter()
+        .find(|(path, _)| path == "/Y.java")
+        .unwrap()
+        .1;
+    assert!(
+        y.contains("<T extends Number> String mm(T n)")
+            && y.contains("<T extends CharSequence> String m(T s)"),
+        "{y}"
+    );
+
+    let fx = fixture(
+        r#"
+//- /I.java
+interface I { <T extends Number> String m(T n); }
+//- /X.java
+class X implements I { public <T extends Number> String m$0(T n) { return "x"; } }
+"#,
+    );
+    let change = crate::rename::rename(&fx.db, position(&fx), "mm").unwrap();
+    let changed = apply_change(&fx, &change);
+    assert!(
+        changed.iter().all(|(_, text)| text.contains(" mm(T n)")),
+        "{changed:?}"
+    );
+    assert_eq!(changed.len(), 2);
+}
+
+/// 兄弟实现的形参类型解析不出来，判断不了它是不是同一族：不拒绝，按原来的做法处理。
+#[test]
+fn rename_override_falls_back_for_undecidable_sibling() {
+    let fx = fixture(
+        r#"
+//- /I.java
+interface I { String m(int a); }
+//- /X.java
+class X implements I { public String m$0(int a) { return "x"; } }
+//- /Y.java
+abstract class Y implements I { public String m(Missing a) { return "y"; } }
+"#,
+    );
+    // 判断不了的兄弟方法按原来的做法处理，不拒绝
+    let change = crate::rename::rename(&fx.db, position(&fx), "mm").unwrap();
+    let changed = apply_change(&fx, &change);
+    assert!(changed
+        .iter()
+        .any(|(path, text)| path == "/X.java" && text.contains("mm(int a)")));
+    assert!(changed
+        .iter()
+        .any(|(path, text)| path == "/I.java" && text.contains("mm(int a)")));
+
+    // 形参解析不出来，但没有同名同参数个数、可能和它构成覆写的方法：照常改名
+    for src in [
+        "//- /A.java\nclass A { void m$0(Missing x) {} void use() { m(null); } }\n",
+        "//- /A.java\nclass A { void m$0(Missing x) {} }\n//- /B.java\nclass B extends A { void m(Missing a, int b) {} }\n",
+    ] {
+        let fx = fixture(src);
+        let change = crate::rename::rename(&fx.db, position(&fx), "mm")
+            .unwrap_or_else(|err| panic!("{err}\n{src}"));
+        let a = &apply_change(&fx, &change)
+            .into_iter()
+            .find(|(path, _)| path == "/A.java")
+            .unwrap()
+            .1;
+        assert!(a.contains("void mm(Missing x)"), "{a}");
+    }
+}
+
+/// 上界等价但写法不同（次序不同、`T` 与 `T extends Object`）、或者形参有解析不出来的类型
+/// 但另一个确定的形参就排除了覆写：都照常改名，和原来一样改到接口方法和调用。
+#[test]
+fn rename_override_does_not_refuse_undecidable_matches() {
+    let cases = [
+        "//- /I.java\ninterface A {}\ninterface B<T> {}\nclass N {}\ninterface I { <T extends N & B<T> & A> String m(T val); }\n//- /X.java\nclass X implements I { public <U extends N & A & B<U>> String m$0(U val) { return \"x\"; } String use(I i) { return i.m(null); } }\n",
+        "//- /I.java\ninterface I { <T> String m(T val); }\n//- /X.java\nclass X implements I { public <U extends Object> String m$0(U val) { return \"x\"; } String use(I i) { return i.m(null); } }\n",
+        "//- /I.java\ninterface I { String m(int a, int b); }\n//- /X.java\nclass X implements I { public String m$0(int a, int b) { return \"x\"; } String use(I i) { return i.m(1, 2); } }\n//- /Y.java\nclass Y extends X { public String m(Missing dep, String text) { return \"other\"; } }\n",
+    ];
+    for src in cases {
+        let fx = fixture(src);
+        let change = crate::rename::rename(&fx.db, position(&fx), "mm")
+            .unwrap_or_else(|err| panic!("{err}\n{src}"));
+        let changed = apply_change(&fx, &change);
+        let text = |file: &str| {
+            changed
+                .iter()
+                .find(|(path, _)| path == file)
+                .map(|(_, t)| t.clone())
+                .unwrap_or_default()
+        };
+        assert!(text("/I.java").contains(" mm("), "{src}\n{changed:?}");
+        assert!(text("/X.java").contains("i.mm("), "{src}\n{changed:?}");
+        assert!(!text("/Y.java").contains("mm("), "{src}\n{changed:?}");
+    }
+}
+
+/// 覆写关系按父类型的类型实参、方法的类型参数、擦除、数组元素类型和包访问权限判断：只是同名的
+/// 重载（以及对它们的调用）不跟着改名，静态方法的隐藏不算覆写。每一例改名之后 javac 都能编译。
+#[test]
+fn rename_override_family_follows_jls_overriding() {
+    let cases: &[(&str, &str, &[&str])] = &[
+        (
+            "method-level type parameter, override by erasure",
+            r#"
+//- /I.java
+interface I { <T> String m(T t); }
+//- /X.java
+class X implements I {
+    public String m$0(Object t) { return "impl"; }
+    public String m(Integer i) { return "overload"; }
+    public String mm(Integer i) { return "existing"; }
+}
+//- /Main.java
+class Main { String f(I i, X x) { return i.m("x") + x.m(1) + x.mm(1); } }
+"#,
+            &[
+                "<T> String mm(T t)",
+                "String mm(Object t)",
+                "String m(Integer i)",
+                r#"i.mm("x") + x.m(1) + x.mm(1)"#,
+            ],
+        ),
+        (
+            "class type parameter not yet substituted",
+            r#"
+//- /I.java
+interface I<T> { String m(T t); }
+//- /A.java
+class A<T> implements I<T> {
+    public String m(T t) { return "base"; }
+    public String m(Integer i) { return "overload"; }
+}
+//- /X.java
+class X extends A<String> { public String m$0(String s) { return "impl"; } }
+//- /Main.java
+class Main { String f(I<String> i, X x) { return i.m("hello") + x.m(1); } }
+"#,
+            &[
+                "interface I<T> { String mm(T t); }",
+                r#"String mm(T t) { return "base"; }"#,
+                "String m(Integer i)",
+                r#"String mm(String s) { return "impl"; }"#,
+                r#"i.mm("hello") + x.m(1)"#,
+            ],
+        ),
+        (
+            "array element types",
+            r#"
+//- /I.java
+interface I<T> { String m(T t); }
+//- /X.java
+class X implements I<String[]> { public String m$0(String[] s) { return "x"; } }
+//- /Y.java
+class Y implements I<String[]> {
+    public String m(String[] s) { return "y"; }
+    public String m(Integer[] i) { return "other"; }
+}
+//- /Main.java
+class Main { String f(Y y) { return y.m(new String[0]) + y.m(new Integer[0]); } }
+"#,
+            &[
+                r#"public String mm(String[] s) { return "y"; }"#,
+                r#"public String m(Integer[] i) { return "other"; }"#,
+                "y.mm(new String[0]) + y.m(new Integer[0])",
+            ],
+        ),
+        (
+            "package-private method is not inherited in another package",
+            r#"
+//- /a/A.java
+package a; public class A { String m(int v) { return "a"; } }
+//- /a/X.java
+package a; public class X extends A { public String m$0(int v) { return "x"; } }
+//- /b/Y.java
+package b; public class Y extends a.A { public String m(int v) { return "unrelated"; } }
+//- /Main.java
+class Main { String f(a.X x, b.Y y) { return x.m(1) + y.m(2); } }
+"#,
+            &[
+                r#"String mm(int v) { return "a"; }"#,
+                r#"public String mm(int v) { return "x"; }"#,
+                r#"public String m(int v) { return "unrelated"; }"#,
+                "x.mm(1) + y.m(2)",
+            ],
+        ),
+        (
+            "siblings with different type arguments",
+            r#"
+//- /I.java
+interface I<T> { String m(T t); }
+//- /A.java
+abstract class A<T> implements I<T> {}
+//- /X.java
+class X extends A<String> {
+    public String m$0(String s) { return "x"; }
+    public String m(Integer i) { return "not override"; }
+}
+//- /Y.java
+class Y extends A<Integer> {
+    public String m(Integer i) { return "y"; }
+    public String m(String s) { return "not override"; }
+}
+//- /Main.java
+class Main { String f(X x, Y y) { return x.m(2) + y.m("z"); } }
+"#,
+            &[
+                r#"public String mm(String s) { return "x"; }"#,
+                r#"public String m(Integer i) { return "not override"; }"#,
+                r#"public String mm(Integer i) { return "y"; }"#,
+                r#"public String m(String s) { return "not override"; }"#,
+                r#"x.m(2) + y.m("z")"#,
+            ],
+        ),
+        (
+            "raw supertype",
+            r#"
+//- /I.java
+interface I<T extends Number> { String m(T t); }
+//- /X.java
+class X implements I {
+    public String m$0(Number n) { return "impl"; }
+    public String m(String s) { return "overload"; }
+    public String mm(String s) { return "existing"; }
+}
+"#,
+            &[
+                "String mm(T t);",
+                "String mm(Number n)",
+                "String m(String s)",
+            ],
+        ),
+        (
+            "static method hiding",
+            r#"
+//- /A.java
+class A { static String m(int a) { return "a"; } }
+//- /B.java
+class B extends A { static String m$0(int a) { return "b"; } }
+//- /Main.java
+class Main { String f() { return A.m(1) + B.m(1); } }
+"#,
+            &[
+                r#"class A { static String m(int a) { return "a"; } }"#,
+                r#"static String mm(int a) { return "b"; }"#,
+                "A.m(1) + B.mm(1)",
+            ],
+        ),
+    ];
+    for (what, src, expected) in cases {
+        let fx = fixture(src);
+        let change = crate::rename::rename(&fx.db, position(&fx), "mm")
+            .unwrap_or_else(|err| panic!("{what}: {err}"));
+        let changed = apply_change(&fx, &change);
+        let all: String = fx
+            .files
+            .iter()
+            .filter(|f| !f.path.starts_with("/minicore"))
+            .map(|f| {
+                changed
+                    .iter()
+                    .find(|(path, _)| *path == f.path)
+                    .map_or_else(|| f.source.text(&fx.db).to_string(), |(_, t)| t.clone())
+            })
+            .collect();
+        for part in *expected {
+            assert!(all.contains(part), "{what}: missing `{part}` in\n{all}");
+        }
+    }
+}
+
+#[test]
 fn rename_class_renames_constructor_and_file() {
     let fx = fixture(
         r#"

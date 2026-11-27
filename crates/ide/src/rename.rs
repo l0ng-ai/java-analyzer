@@ -16,6 +16,7 @@ use hir::{
     MethodId, Modifiers, Name, Semantics, Ty,
 };
 use ide_db::{
+    overrides::{overridden_methods, same_ty, OverriddenMethod},
     search::{find_references_with_docs, refers_to},
     TextEdit,
 };
@@ -287,8 +288,69 @@ pub(crate) fn field_accessors(db: &dyn Db, field: FieldId) -> Vec<(MethodId, Acc
     res
 }
 
-/// 方法所在的整条覆写链：它覆写的、覆写它的，以及这些方法的其它覆写者。
+/// 方法所在的整个覆写族：它覆写的、覆写它的，以及这些方法的其它覆写者（含兄弟实现，
+/// 例如同一接口的另一个实现类），一直追到不再有新成员。覆写关系和非法覆写检查用的是同一个
+/// 判断（[`overridden_methods`]）。判断不了的方法（形参类型解析不出来、泛型方法的类型参数
+/// 上界不完全相同）按粗略的覆写链（[`refers_to`] 的判断，[`loose_method_family`]）决定
+/// 要不要算进来。
 fn method_family(db: &dyn Db, method: MethodId) -> Vec<MethodId> {
+    let is_static = |m: MethodId| hir::method_flags(db, m).is_some_and(|f| f.is_static());
+    let Some(name) = Definition::Method(method).name(db) else {
+        return vec![method];
+    };
+    // 静态方法只会隐藏，不参与覆写
+    if is_static(method) {
+        return vec![method];
+    }
+    let loose = loose_method_family(db, method);
+    // 起点自己就判断不了：完全照粗略的覆写链（[`refers_to`] 的判断）
+    if overridden_methods(db, method).undecided {
+        return loose;
+    }
+    let mut family: Vec<MethodId> = vec![method];
+    let mut seen: FxHashSet<MethodId> = family.iter().copied().collect();
+    let mut next = 0;
+    while let Some(&member) = family.get(next) {
+        next += 1;
+        let overridden = overridden_methods(db, member);
+        for o in &overridden.methods {
+            let decided = same_type_param_bounds(db, member, o);
+            if (decided || loose.contains(&o.method))
+                && !is_static(o.method)
+                && seen.insert(o.method)
+            {
+                family.push(o.method);
+            }
+        }
+        for sub in all_subclasses(db, member.class) {
+            let Some(data) = class_data(db, sub) else {
+                continue;
+            };
+            for (idx, m) in data.methods_named(&name) {
+                let candidate = MethodId { class: sub, idx };
+                if seen.contains(&candidate) || m.flags.is_static() {
+                    continue;
+                }
+                let overridden = overridden_methods(db, candidate);
+                let decided = match overridden.methods.iter().find(|o| o.method == member) {
+                    Some(o) if same_type_param_bounds(db, candidate, o) => true,
+                    Some(_) => false,
+                    None if overridden.undecided => false,
+                    None => continue,
+                };
+                if decided || loose.contains(&candidate) {
+                    seen.insert(candidate);
+                    family.push(candidate);
+                }
+            }
+        }
+    }
+    family
+}
+
+/// 粗略的覆写链（[`refers_to`] 的判断）：起点、它的父方法，以及这些类的子类里
+/// [`refers_to`] 起点的方法。
+fn loose_method_family(db: &dyn Db, method: MethodId) -> Vec<MethodId> {
     let target = Definition::Method(method);
     let Some(name) = target.name(db) else {
         return vec![method];
@@ -317,6 +379,27 @@ fn method_family(db: &dyn Db, method: MethodId) -> Vec<MethodId> {
         }
     }
     family
+}
+
+/// 覆写关系只按位置对应方法的类型参数，不比较它们的上界（JLS §8.4.4 要求相同）；改名时再
+/// 比较一次。`sub` 不是泛型方法时（靠擦除覆写）没有可比的。
+fn same_type_param_bounds(db: &dyn Db, sub: MethodId, overridden: &OverriddenMethod) -> bool {
+    let n = method_sig(db, sub).n_type_params;
+    (0..n).all(|idx| {
+        let bounds = |owner| {
+            hir::type_param_bounds(db, hir::TypeParamId { owner, idx })
+                .iter()
+                .map(|b| b.subst(&overridden.subst))
+                .collect::<Vec<Ty>>()
+        };
+        let own = bounds(hir::GenericOwner::Method(sub));
+        let sup = bounds(hir::GenericOwner::Method(overridden.method));
+        own.len() == sup.len()
+            && own
+                .iter()
+                .zip(&sup)
+                .all(|(a, b)| !a.contains_unknown() && same_ty(db, a, b))
+    })
 }
 
 fn check_conflicts(db: &dyn Db, def: &Definition, new_name: &str) -> Result<(), String> {
@@ -486,14 +569,38 @@ pub(crate) fn rename(
                         "This method overrides a library method and cannot be renamed"
                     )
                 })?;
+                // 起点之外的成员所在的类里也可能已经有同签名的新名字方法
+                if member != method {
+                    check_conflicts(db, &member_def, new_name)?;
+                }
                 add_declaration(&member_def, &mut items);
             }
             // 菱形匿名类里的覆写（没有登记成类，覆写链里没有它们）
             for (file, member) in crate::navigation::diamond_anonymous_overrides(db, &family) {
                 items.push((file.file_id(db), member.name_range, new_name.to_owned()));
             }
-            // 引用搜索本身就按覆写链匹配，搜一次即可
-            add_references(&def, &mut items);
+            // 引用搜索按祖先/子孙关系匹配，兄弟实现之间互不匹配：从族里最上层的方法（族里没有
+            // 它覆写的方法）各搜一次，就覆盖了全族的调用点。搜索对重载的区分是粗略的，再按
+            // 引用处解析到的方法过滤：解析到族外的方法（同名的另一个重载）不改，解析不出来的
+            // （文档注释里的提及）照旧改
+            let roots = family.iter().filter(|member| {
+                !overridden_methods(db, **member)
+                    .methods
+                    .iter()
+                    .any(|o| family.contains(&o.method))
+            });
+            for root in roots {
+                for r in find_references_with_docs(db, &Definition::Method(*root)) {
+                    let found = base_db::source_file(db, r.file_id)
+                        .and_then(|file| definition_at(db, file, r.range.start()));
+                    let outside = found.is_some_and(
+                        |(_, found)| !matches!(found, Definition::Method(m) if family.contains(&m)),
+                    );
+                    if !outside {
+                        items.push((r.file_id, r.range, new_name.to_owned()));
+                    }
+                }
+            }
         }
         Definition::Class(class) => {
             add_declaration(&def, &mut items);
