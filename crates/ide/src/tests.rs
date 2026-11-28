@@ -1922,7 +1922,7 @@ fn goto_definition_in_annotation_values() {
     }
 }
 
-/// 光标处构造调用跳到的构造器声明的开头。
+/// 光标处调用跳到的方法 / 构造器声明的开头。
 fn constructor_target(text: &str) -> String {
     let fx = fixture(text);
     let result = navigation::goto_definition(&fx.db, position(&fx)).unwrap();
@@ -1930,6 +1930,44 @@ fn constructor_target(text: &str) -> String {
     let nav = &result.info[0];
     let full = slice(&fx, &nav.file, nav.full_range);
     full.split(')').next().unwrap().to_owned() + ")"
+}
+
+/// lambda 体的形状、方法引用的形参个数排除不潜在适用的重载（JLS 15.12.2.1），和声明顺序无关。
+#[test]
+fn functional_arg_shape_picks_the_overload() {
+    let src = r#"
+interface Runnable { void run(); }
+interface Callable<V> { V call() throws Exception; }
+class Main {
+    static String r(Runnable r) { return "r"; }
+    static int r(Callable<String> c) { return 2; }
+    void f() { r$0(() -> "x"); r(() -> {}); }
+}
+"#;
+    assert_eq!(constructor_target(src), "static int r(Callable<String> c)");
+    let void_body = src
+        .replace("r$0(", "r(")
+        .replace("r(() -> {})", "r$0(() -> {})");
+    assert_eq!(
+        constructor_target(&void_body),
+        "static String r(Runnable r)"
+    );
+
+    // 方法引用：`helper` 只有一个形参，只匹配 `Function`
+    let method_ref = r#"
+interface Function<T, R> { R apply(T t); }
+interface BiFunction<T, U, R> { R apply(T t, U u); }
+class Main {
+    static int helper(String s) { return 0; }
+    static String a(BiFunction<String, String, Integer> p) { return ""; }
+    static String a(Function<String, Integer> p) { return ""; }
+    void f() { a$0(Main::helper); }
+}
+"#;
+    assert_eq!(
+        constructor_target(method_ref),
+        "static String a(Function<String, Integer> p)"
+    );
 }
 
 /// 菱形构造在 `Box(T)` 和更具体的 `Box(CharSequence)` 之间按 JLS 15.12.2.5 选后者，
