@@ -1290,7 +1290,7 @@ fn override_checks(
         hierarchy_is_resolved(db, method.class)
             && hir::lookup_class(db, "java/lang/Object").is_some()
             && !std::iter::once(method.class)
-                .chain(hir::all_supers(db, method.class))
+                .chain(hir::all_supers(db, method.class).iter().copied())
                 .any(|class| lombok_involved(db, class))
             // JLS 9.6.4.4 也允许显式声明的记录组件访问器标注 @Override。
             && !(data.kind == ClassKind::Record
