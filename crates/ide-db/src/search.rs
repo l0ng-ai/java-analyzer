@@ -236,13 +236,16 @@ fn overrides_something(db: &dyn Db, method: MethodId) -> bool {
     let Some(m) = data.methods.get(method.idx as usize) else {
         return true;
     };
-    hir::all_supers(db, method.class).into_iter().any(|sup| {
-        class_data(db, sup).is_none_or(|sup_data| {
-            sup_data
-                .methods_named(&m.name)
-                .any(|(_, other)| other.params.len() == m.params.len())
+    hir::all_supers(db, method.class)
+        .iter()
+        .copied()
+        .any(|sup| {
+            class_data(db, sup).is_none_or(|sup_data| {
+                sup_data
+                    .methods_named(&m.name)
+                    .any(|(_, other)| other.params.len() == m.params.len())
+            })
         })
-    })
 }
 
 /// 名字引用所在的表达式是不是被写入（赋值的左侧、`++` / `--` 的操作数）。

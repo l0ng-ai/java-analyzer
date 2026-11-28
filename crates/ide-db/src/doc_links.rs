@@ -366,7 +366,7 @@ fn find_member(
     params: Option<&[String]>,
 ) -> Option<Definition> {
     let mut classes = vec![class];
-    classes.extend(all_supers(db, class));
+    classes.extend(all_supers(db, class).iter().copied());
     for c in classes {
         let Some(data) = class_data(db, c) else {
             continue;

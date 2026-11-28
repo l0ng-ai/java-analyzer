@@ -314,6 +314,31 @@ fn method_flags(cx: &InferCtx<'_>, method: MethodId) -> Modifiers {
     crate::lower::method_flags(cx.db, method).unwrap_or_default()
 }
 
+/// 类及其所有祖先是否都解析成功，并且都不依赖会凭空生成成员的工具。
+/// 按类缓存：每次构造、每个解析不了的名字、每次重载决议的排除检查都要问一遍。
+/// 只读追踪查询，可以放心缓存（[`InferCtx::hierarchy_is_reliable`] 读它）。
+#[salsa::tracked]
+fn hierarchy_reliable(db: &dyn base_db::Db, _ws: base_db::Workspace, class: ClassId) -> bool {
+    std::iter::once(class)
+        .chain(all_supers(db, class).iter().copied())
+        .all(|c| {
+            let Some(data) = class_header(db, c) else {
+                return false;
+            };
+            let declared = data.superclass.iter().count() + data.interfaces.len();
+            if class_supertypes(db, c).len() != declared {
+                return false;
+            }
+            if data.annotations.iter().any(|a| a.contains("lombok")) {
+                return false;
+            }
+            match class_source_file(db, c) {
+                Some(file) => !hir_def::file_scope(db, file).imports_lombok(),
+                None => true,
+            }
+        })
+}
+
 impl InferCtx<'_> {
     pub(super) fn infer_expr(&mut self, expr: &ast::Expr, expected: Option<&Ty>) -> Ty {
         match self.infer_value(expr, expected) {
@@ -986,25 +1011,7 @@ impl InferCtx<'_> {
     /// 类及其所有祖先是否都解析成功，并且都不依赖会凭空生成成员的工具。
     /// 只有这样，"找不到成员"才是确定的。
     pub(super) fn hierarchy_is_reliable(&self, class: ClassId) -> bool {
-        let db = self.db;
-        std::iter::once(class)
-            .chain(all_supers(db, class))
-            .all(|c| {
-                let Some(data) = class_header(db, c) else {
-                    return false;
-                };
-                let declared = data.superclass.iter().count() + data.interfaces.len();
-                if class_supertypes(db, c).len() != declared {
-                    return false;
-                }
-                if data.annotations.iter().any(|a| a.contains("lombok")) {
-                    return false;
-                }
-                match class_source_file(db, c) {
-                    Some(file) => !hir_def::file_scope(db, file).imports_lombok(),
-                    None => true,
-                }
-            })
+        hierarchy_reliable(self.db, base_db::workspace(self.db), class)
     }
 
     /// 当前在匿名类 / 局部类的类体里，并且 `ty` 就是这一层 `this` 的类型。

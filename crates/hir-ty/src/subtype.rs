@@ -604,7 +604,7 @@ pub fn lub(db: &dyn Db, tys: &[Ty]) -> Ty {
         classes.push(*class);
     }
     let with_supers = |class: ClassId| {
-        let mut res = hir_def::all_supers(db, class);
+        let mut res = hir_def::all_supers(db, class).to_vec();
         res.push(class);
         res
     };

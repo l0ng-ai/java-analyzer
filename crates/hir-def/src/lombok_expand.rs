@@ -199,7 +199,7 @@ fn add_delegates(db: &dyn Db, id: ClassId, data: &mut ClassData) {
         };
 
         let mut classes = vec![target];
-        classes.extend(all_supers(db, target));
+        classes.extend(all_supers(db, target).iter().copied());
         for class in classes {
             let binary = class.binary_name(db);
             if binary == "java/lang/Object" || class == id || is_expanding(class) {
