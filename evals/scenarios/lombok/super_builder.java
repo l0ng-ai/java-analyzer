@@ -81,7 +81,7 @@ import java.util.List;
 class Main {
     Dog run() {
         Dog dog = Dog.builder().id(7L).version(2).name("rex").tag("a").bark(3).build();
-        var /*@built*/built = Dog.builder().name("x").bark(1).build();
+        var /*@built*/built = Dog.builder().name("x").bark(1)./*@after_chain*/build();
         var /*@b*/b = Dog.builder();
         Dog copy = dog.toBuilder().bark(4).build();
         Animal animal = Animal.builder().name("cat").tags(List.of("a")).clearTags().build();
@@ -106,6 +106,9 @@ class Main {
 //? hover b ~ "DogBuilder<?, ?> b"
 //? def parent_setter -> name
 //? def chain -> bark
+//? hover chain ~ "public Dog.DogBuilder<?, ?> bark(int bark)"
+//? hover parent_setter ~ "public Dog.DogBuilder<?, ?> name(String name)"
+//? complete after_chain has build bark
 //? complete members has id version name tag tags clearTags bark build
 //? hover parent_first ~ "DogBuilder<?, ?> parentFirst"
 //? complete no_builder lacks builder toBuilder
