@@ -615,6 +615,37 @@ class A {
         }
     }
 
+    /// JLS 3.3：`\uXXXX` 在分词之前翻译。三份文件 javac 都能编译，
+    /// 因此不应该有任何语法错误（报告见 issue：此前分别报 5 个、约 10 个语法
+    /// 错误和一个 Cannot resolve symbol）。
+    #[test]
+    fn unicode_escapes_translate_before_lexing() {
+        // 1. token 之间的转义：`\u0020` 就是空格
+        let text = "class UnicodeSpace {\n    int\\u0020x = 1;\n    int y = 2;\n}\n";
+        let parse = CompilationUnit::parse(text);
+        assert_eq!(parse.syntax_node().text().to_string(), text);
+        assert!(parse.errors().is_empty(), "{:#?}", parse.errors());
+
+        // 2. 转义拼出注释起点：整行在 javac 眼里是注释
+        let text =
+            "class UnicodeCommentStart {\n\\u002f\\u002f javac sees a comment\n    int y = 2;\n}\n";
+        let parse = CompilationUnit::parse(text);
+        assert_eq!(parse.syntax_node().text().to_string(), text);
+        assert!(parse.errors().is_empty(), "{:#?}", parse.errors());
+
+        // 3. 注释里的 `\u000A` 是行终止符：后面的 `int x = 1;` 是真代码
+        let text = "class UnicodeNewlineCode {\n    int use() {\n        // \\u000A int x = 1;\n        return x;\n    }\n}\n";
+        let parse = CompilationUnit::parse(text);
+        assert_eq!(parse.syntax_node().text().to_string(), text);
+        assert!(parse.errors().is_empty(), "{:#?}", parse.errors());
+        let declared = parse
+            .syntax_node()
+            .descendants()
+            .filter_map(ast::VariableDeclarator::cast)
+            .any(|d| d.name().is_some_and(|n| n.text() == "x"));
+        assert!(declared, "注释里的转义换行之后应当出现 `int x = 1;` 声明");
+    }
+
     #[test]
     fn diff_range_finds_minimal_edit() {
         assert_eq!(diff_range("abc", "abc"), None);

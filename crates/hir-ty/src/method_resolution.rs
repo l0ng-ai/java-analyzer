@@ -352,12 +352,7 @@ impl Call {
         let mut bindings = inference.bindings;
         let formals: Vec<Ty> = (0..n_args).map(|idx| raw_param(self, idx)).collect();
         for owner in &self.inference.owners {
-            let n = match owner {
-                GenericOwner::Method(_) => self.sig.n_type_params,
-                GenericOwner::Class(class) => hir_def::class_header(db, *class)
-                    .map_or(0, |data| data.type_params.len() as u32),
-            };
-            for idx in 0..n {
+            for idx in 0..n_type_params_of(db, *owner, &self.sig) {
                 let id = TypeParamId { owner: *owner, idx };
                 if bindings.contains(id)
                     || formals
@@ -731,7 +726,7 @@ fn certain_ambiguity(
         Arg::MethodRef => false,
     });
     let candidates_clear = in_phase.iter().all(|s| {
-        s.call.sig.n_type_params == 0
+        !is_generic(s)
             && s.params
                 .iter()
                 .all(|p| !p.contains_unknown() && !mentions_type_param(p))
@@ -777,7 +772,8 @@ fn more_specific(db: &dyn Db, a: &Scored, b: &Scored, args: &[Arg]) -> bool {
     if unclear {
         return false;
     }
-    if a.params != b.params && (a.call.sig.n_type_params > 0 || b.call.sig.n_type_params > 0) {
+    let (a_generic, b_generic) = (is_generic(a), is_generic(b));
+    if a.params != b.params && (a_generic || b_generic) {
         // 有一方是泛型方法时按声明的形参比较（JLS 15.12.2.5、18.5.4）：代换后的形参只说明这次调用
         // 两边都能接受实参。`<T> assertThat(T)` 取 `T = List<Pet>` 之后比
         // `assertThat(List<? extends E>)` 取 `E = Pet` 得到的 `List<? extends Pet>` 还"窄"，
@@ -796,12 +792,38 @@ fn more_specific(db: &dyn Db, a: &Scored, b: &Scored, args: &[Arg]) -> bool {
     if a.params != b.params {
         return true;
     }
-    match (a.call.sig.n_type_params, b.call.sig.n_type_params) {
-        (0, nb) => nb > 0,
+    match (a_generic, b_generic) {
+        (false, b_generic) => b_generic,
         // 代换后一样（`of(E)` 取 `E = String[]` 和 `of(E...)` 取 `E = String`）：
         // 按声明的形参类型比较（JLS 15.12.2.5）
-        (_, nb) if nb > 0 => declared_more_specific(db, a, b) && !declared_more_specific(db, b, a),
-        _ => false,
+        (true, true) => declared_more_specific(db, a, b) && !declared_more_specific(db, b, a),
+        (true, false) => false,
+    }
+}
+
+/// 候选按泛型方法看待：方法自己有类型参数，或者是菱形构造器、声明的形参里用到了被构造类的
+/// 类型参数（JLS 15.9.3：菱形构造时构造器被看成以类的类型参数为类型参数的泛型方法）。
+/// `new Box<>("s")` 里 `Box(T)` 取 `T = String` 之后和 `Box(CharSequence)` 代换后一样宽，
+/// 得按声明的 `T` 比较，后者才更具体。
+fn is_generic(s: &Scored) -> bool {
+    s.call.sig.n_type_params > 0
+        || (0..s.params.len()).any(|idx| {
+            let formal = s.call.formal_param_ty(idx);
+            s.call
+                .inference
+                .owners
+                .iter()
+                .any(|owner| formal.mentions_params_of(*owner))
+        })
+}
+
+/// 所有者声明的类型参数个数。
+fn n_type_params_of(db: &dyn Db, owner: GenericOwner, sig: &MethodSig) -> u32 {
+    match owner {
+        GenericOwner::Method(_) => sig.n_type_params,
+        GenericOwner::Class(class) => {
+            hir_def::class_header(db, class).map_or(0, |data| data.type_params.len() as u32)
+        }
     }
 }
 
@@ -810,7 +832,8 @@ fn declared_more_specific(db: &dyn Db, a: &Scored, b: &Scored) -> bool {
     let n = a.params.len();
     let a_formals: Vec<Ty> = (0..n).map(|i| a.call.formal_param_ty(i)).collect();
     let b_formals: Vec<Ty> = (0..n).map(|i| b.call.formal_param_ty(i)).collect();
-    let mut inference = Inference::new(vec![GenericOwner::Method(b.call.method)]);
+    // 菱形构造时被构造类的类型参数也按实参推断
+    let mut inference = Inference::new(b.call.inference.owners.clone());
     for (fb, fa) in b_formals.iter().zip(&a_formals) {
         inference.unify(db, fb, fa);
     }
@@ -820,19 +843,18 @@ fn declared_more_specific(db: &dyn Db, a: &Scored, b: &Scored) -> bool {
         .all(|(fa, fb)| is_subtype(db, fa, &fb.subst(&inference.bindings)));
     // 推出来的绑定还得满足 `b` 的类型参数声明的上界：`<T> f(T)` 的 `T` 不能传给
     // `<U extends Comparable<? super U>> f(U)`
-    fits && (0..b.call.sig.n_type_params).all(|idx| {
-        let param = TypeParamId {
-            owner: GenericOwner::Method(b.call.method),
-            idx,
-        };
-        let Some(binding) = inference.bindings.get(param) else {
-            return true;
-        };
-        type_param_bounds(db, param).iter().all(|bound| {
-            let bound = bound
-                .subst(&b.call.receiver_subst)
-                .subst(&inference.bindings);
-            bound.contains_unknown() || is_subtype(db, binding, &bound)
+    fits && b.call.inference.owners.iter().all(|&owner| {
+        (0..n_type_params_of(db, owner, &b.call.sig)).all(|idx| {
+            let param = TypeParamId { owner, idx };
+            let Some(binding) = inference.bindings.get(param) else {
+                return true;
+            };
+            type_param_bounds(db, param).iter().all(|bound| {
+                let bound = bound
+                    .subst(&b.call.receiver_subst)
+                    .subst(&inference.bindings);
+                bound.contains_unknown() || is_subtype(db, binding, &bound)
+            })
         })
     })
 }

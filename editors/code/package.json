@@ -2,7 +2,7 @@
   "name": "java-analyzer",
   "displayName": "java-analyzer",
   "description": "Java language support through the java-analyzer language server",
-  "version": "0.3.5",
+  "version": "0.3.8",
   "publisher": "l0ng-ai",
   "license": "MIT",
   "repository": {

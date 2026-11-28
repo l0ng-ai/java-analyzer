@@ -208,6 +208,34 @@ class Circle implements Shape {
     assert_eq!(result.info.docs.as_deref(), Some("The area."));
 }
 
+/// 字段的文档注释挂在 FIELD_DECL 上：没有初始值、`final`、注解、数组、一行声明多个变量
+/// 和 Lombok 访问器都要找得到。
+#[test]
+fn hover_shows_field_docs_without_initializer() {
+    let cases = [
+        ("int count;", "this.cou$0nt"),
+        ("int count = 0;", "this.cou$0nt"),
+        ("final int count;", "this.cou$0nt"),
+        ("@Deprecated int count;", "this.cou$0nt"),
+        ("int[] count;", "this.cou$0nt"),
+        ("int other, count;", "this.cou$0nt"),
+        ("int count, other = 1;", "this.cou$0nt"),
+        ("@lombok.Getter int count;", "getCou$0nt()"),
+        ("@lombok.Setter int count;", "setCou$0nt(1)"),
+    ];
+    for (field, use_site) in cases {
+        let fx = fixture(&format!(
+            "class Main {{\n    /** Docs. */ {field}\n    Main() {{ count = 1; }}\n    void f() {{ Object o = {use_site}; }}\n}}\n"
+        ));
+        let result = hover::hover(&fx.db, position(&fx)).unwrap();
+        assert_eq!(
+            result.info.docs.as_deref(),
+            Some("Docs."),
+            "{field} / {use_site}"
+        );
+    }
+}
+
 #[test]
 fn signature_help_tracks_active_parameter() {
     let fx = fixture(
@@ -1683,5 +1711,143 @@ fn goto_definition_in_annotation_values() {
             (name.to_string(), kind),
             "{source}"
         );
+    }
+}
+
+/// 光标处构造调用跳到的构造器声明的开头。
+fn constructor_target(text: &str) -> String {
+    let fx = fixture(text);
+    let result = navigation::goto_definition(&fx.db, position(&fx)).unwrap();
+    assert_eq!(result.info.len(), 1);
+    let nav = &result.info[0];
+    let full = slice(&fx, &nav.file, nav.full_range);
+    full.split(')').next().unwrap().to_owned() + ")"
+}
+
+/// 菱形构造在 `Box(T)` 和更具体的 `Box(CharSequence)` 之间按 JLS 15.12.2.5 选后者，
+/// 和声明顺序无关；显式给出类型实参时 `T` 已经定下来，照常比较代换后的形参。
+#[test]
+fn diamond_constructor_picks_the_most_specific_overload() {
+    let generic_first = r#"
+class Main {
+    static class Box<T> {
+        Box(T value) {}
+        Box(CharSequence value) {}
+    }
+    void f() { new Bo$0x<>("s"); }
+}
+"#;
+    assert_eq!(constructor_target(generic_first), "Box(CharSequence value)");
+    let concrete_first = r#"
+class Main {
+    static class Box<T> {
+        Box(CharSequence value) {}
+        Box(T value) {}
+    }
+    void f() { new Bo$0x<>("s"); }
+}
+"#;
+    assert_eq!(
+        constructor_target(concrete_first),
+        "Box(CharSequence value)"
+    );
+
+    // 实参是形参类型的子类型
+    let subtype = r#"
+class Main {
+    static class Base {}
+    static class Sub extends Base {}
+    static class G<T> {
+        G(T value) {}
+        G(Base value) {}
+    }
+    void f(Sub s) { new $0G<>(s); }
+}
+"#;
+    assert_eq!(constructor_target(subtype), "G(Base value)");
+
+    // 显式类型实参：`Box<String>` 时 `Box(T)` 是 `Box(String)`，更具体
+    let explicit_string = r#"
+class Main {
+    static class Box<T> {
+        Box(T value) {}
+        Box(CharSequence value) {}
+    }
+    void f() { new Bo$0x<String>("s"); }
+}
+"#;
+    assert_eq!(constructor_target(explicit_string), "Box(T value)");
+    let explicit_object = r#"
+class Main {
+    static class Box<T> {
+        Box(T value) {}
+        Box(CharSequence value) {}
+    }
+    void f() { new Bo$0x<Object>("s"); }
+}
+"#;
+    assert_eq!(
+        constructor_target(explicit_object),
+        "Box(CharSequence value)"
+    );
+}
+
+/// Lombok 字段和它生成的访问器算一组：从字段或者任一访问器的调用处查引用，
+/// 都列出字段的直接访问和全部访问器的调用点，setter 的调用算写入。
+#[test]
+fn references_of_lombok_field_include_accessor_calls() {
+    let files = |cursor_in_foo: bool| {
+        let (field, call) = if cursor_in_foo {
+            ("private String ti$0tle;", "foo.getTitle()")
+        } else {
+            ("private String title;", "foo.getTi$0tle()")
+        };
+        format!(
+            r#"
+//- /demo/Foo.java
+package demo;
+import lombok.Data;
+@Data
+public class Foo {{
+    {field}
+    private int count;
+    String raw() {{ return title; }}
+}}
+//- /demo/Bar.java
+package demo;
+public class Bar {{
+    public void run() {{
+        Foo foo = new Foo();
+        String t = {call};
+        foo.setTitle("x");
+        int c = foo.getCount();
+    }}
+}}
+"#
+        )
+    };
+    for cursor_in_foo in [true, false] {
+        let fx = fixture(&files(cursor_in_foo));
+        let foo = fx.file_by_path("/demo/Foo.java").file_id;
+        let refs = references::find_all_refs(&fx.db, position(&fx), true).unwrap();
+        let text = |file_id, range: TextRange| {
+            let source = base_db::source_file(&fx.db, file_id).unwrap();
+            source.text(&fx.db)[usize::from(range.start())..usize::from(range.end())].to_owned()
+        };
+        let found: Vec<(bool, String, bool)> = refs
+            .iter()
+            .filter(|r| !r.is_declaration)
+            .map(|r| (r.file_id == foo, text(r.file_id, r.range), r.is_write))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (true, "title".to_owned(), false),
+                (false, "getTitle".to_owned(), false),
+                (false, "setTitle".to_owned(), true),
+            ],
+            "{refs:?}"
+        );
+        assert_eq!(refs.iter().filter(|r| r.is_declaration).count(), 1);
     }
 }

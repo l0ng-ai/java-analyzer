@@ -639,7 +639,8 @@ fn known_type_names(db: &dyn Db, file: SourceFile) -> Arc<FxHashSet<String>> {
     Arc::new(known)
 }
 
-/// 类型位置上解析不了的类型名：声明的类型、类型实参、`new`、强制转换、`throws`、`catch` 等。
+/// 类型位置上解析不了的类型名：声明的类型、类型实参、`new`、强制转换、`throws`、`catch`、
+/// 注解名等。
 ///
 /// 只报确定的：带限定符的名字只在限定符解析成已知的类（继承链完整）或已知的包时才报；
 /// 没有登记成类的匿名类里的名字只在能确定它不是父类型继承来的成员类型时才报
@@ -656,25 +657,35 @@ fn unresolved_types(view: &View<'_>, out: &mut Vec<Diagnostic>) {
     let mut resolved_hierarchy: FxHashMap<hir::ClassId, bool> = FxHashMap::default();
     let mut resolved_names: FxHashMap<(hir::TypeScope, hir::Name), bool> = FxHashMap::default();
     for node in view.nodes() {
-        let Some(class_ty) = ast::ClassType::cast(node.clone()) else {
+        let name_ref = if let Some(class_ty) = ast::ClassType::cast(node.clone()) {
+            if node
+                .parent()
+                .is_some_and(|p| p.kind() == SyntaxKind::CLASS_TYPE)
+            {
+                continue;
+            }
+            if class_ty.qualifier().is_some() {
+                let names = known
+                    .get_or_insert_with(|| known_type_names(db, file))
+                    .clone();
+                if let Some(diagnostic) =
+                    unresolved_qualified_type(db, sema, file, &class_ty, &names)
+                {
+                    out.push(diagnostic);
+                }
+                continue;
+            }
+            class_ty.name_ref()
+        } else if let Some(annotation) = ast::Annotation::cast(node.clone()) {
+            // 注解名是 `QualifiedName`，不是 `ClassType`：只查简单名 `@Foo`
+            annotation
+                .name()
+                .filter(|name| name.qualifier().is_none())
+                .and_then(|name| name.name_ref())
+        } else {
             continue;
         };
-        if node
-            .parent()
-            .is_some_and(|p| p.kind() == SyntaxKind::CLASS_TYPE)
-        {
-            continue;
-        }
-        if class_ty.qualifier().is_some() {
-            let names = known
-                .get_or_insert_with(|| known_type_names(db, file))
-                .clone();
-            if let Some(diagnostic) = unresolved_qualified_type(db, sema, file, &class_ty, &names) {
-                out.push(diagnostic);
-            }
-            continue;
-        }
-        let Some(name_ref) = class_ty.name_ref() else {
+        let Some(name_ref) = name_ref else {
             continue;
         };
         let name = name_ref.text();
@@ -1826,6 +1837,188 @@ mod tests {
             .collect()
     }
 
+    /// 注释里的 `\u000A`（JLS 3.3 在分词前翻译）结束注释：后面的
+    /// `int x = 1;` 是真代码，javac 能编译，不该报 Cannot resolve symbol。
+    #[test]
+    fn unicode_newline_in_comment_reveals_the_declaration() {
+        let diags = check(
+            r#"
+class Main {
+    int use() {
+        // \u000A int x = 1;
+        return x;
+    }
+}
+"#,
+        );
+        let unresolved: Vec<_> = diags
+            .iter()
+            .filter(|(code, _)| {
+                matches!(
+                    code,
+                    DiagnosticCode::UnresolvedName
+                        | DiagnosticCode::UnresolvedField
+                        | DiagnosticCode::UnresolvedMethod
+                )
+            })
+            .collect();
+        assert!(unresolved.is_empty(), "{diags:?}");
+    }
+
+    /// 两个同参数个数的泛型构造器竞争、实参里夹着多态表达式（菱形构造）时，
+    /// lambda 形参的类型要来自幸存候选解出来的签名，而不是第一个实参的类型。
+    /// javac 编译无警告（JLS 18.5.2 / 18.5.4）。
+    #[test]
+    fn lambda_params_follow_the_surviving_overload_not_the_first_arg() {
+        let diags = check(
+            r#"
+public class Main {
+    interface Callable<T> {
+        T call() throws Exception;
+    }
+
+    interface Textish {
+        String asString();
+    }
+
+    static final class Wrap implements Textish {
+        @Override
+        public String asString() {
+            return "wrap";
+        }
+    }
+
+    interface Scalar<S> {
+        S value() throws Exception;
+    }
+
+    interface Func<A, B> {
+        B apply(A a) throws Exception;
+    }
+
+    static final class IsBlank implements Scalar<Boolean> {
+        final Textish origin;
+
+        IsBlank(Textish text) {
+            this.origin = text;
+        }
+
+        @Override
+        public Boolean value() {
+            return true;
+        }
+    }
+
+    static final class Flattened<X, Y> implements Func<X, Y> {
+        final Func<X, Scalar<Y>> origin;
+
+        Flattened(Func<X, Scalar<Y>> origin) {
+            this.origin = origin;
+        }
+
+        @Override
+        public Y apply(X x) throws Exception {
+            return this.origin.apply(x).value();
+        }
+    }
+
+    static final class ScalarOf<T> implements Scalar<T> {
+        final Callable<? extends T> origin;
+
+        ScalarOf(Callable<? extends T> origin) {
+            this.origin = origin;
+        }
+
+        @Override
+        public T value() throws Exception {
+            return this.origin.call();
+        }
+    }
+
+    static final class Ternary<T> {
+        final T value;
+
+        <X> Ternary(
+            X input,
+            Func<? super X, Boolean> cond,
+            Func<? super X, ? extends T> cons,
+            Func<? super X, ? extends T> alter
+        ) {
+            throw new UnsupportedOperationException();
+        }
+
+        <X> Ternary(
+            Scalar<? extends X> input,
+            Func<? super X, Boolean> cond,
+            Func<? super X, ? extends T> cons,
+            Func<? super X, ? extends T> alter
+        ) throws Exception {
+            this.value = cond.apply(input.value()) ? cons.apply(input.value()) : alter.apply(input.value());
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        CharSequence cs = new Ternary<>(
+            new ScalarOf<>(() -> new Wrap()),
+            new Flattened<>(IsBlank::new),
+            t -> t,
+            t -> t.asString() + "!"
+        ).value.toString();
+        System.out.println(cs);
+    }
+}
+"#,
+        );
+        let bad: Vec<_> = diags
+            .iter()
+            .filter(|(code, _)| {
+                matches!(
+                    code,
+                    DiagnosticCode::UnresolvedName
+                        | DiagnosticCode::UnresolvedField
+                        | DiagnosticCode::UnresolvedMethod
+                        | DiagnosticCode::ArgumentMismatch
+                        | DiagnosticCode::AmbiguousCall
+                )
+            })
+            .collect();
+        assert!(bad.is_empty(), "{diags:?}");
+    }
+
+    /// 泛型类的构造器引用作实参、调用结果又没有目标类型时，类的类型实参由函数类型的形参推出：
+    /// `apply(Box::new, "x")` 是 `Box<String>`，不是原始的 `Box`。
+    #[test]
+    fn generic_constructor_refs_take_type_args_from_functional_inputs() {
+        let diags = check(
+            r#"
+interface Function<A, B> { B apply(A a); }
+interface BiFunction<A, B, C> { C apply(A a, B b); }
+class Box<T> { T v; Box(T v) { this.v = v; } T get() { return v; } }
+class Pair<K, V> {
+    K k; V v;
+    Pair(K k, V v) { this.k = k; this.v = v; }
+    K key() { return k; }
+    V value() { return v; }
+}
+public class Main {
+    static <A, B> B apply(Function<A, B> f, A a) { return f.apply(a); }
+    static <A, B, C> C apply2(BiFunction<A, B, C> f, A a, B b) { return f.apply(a, b); }
+    void m() {
+        String w = apply(Box::new, "x").get().trim();
+        int q = apply2(Pair::new, "a", 1).value().intValue();
+        String r = apply2(Pair::new, "a", 1).key().trim();
+    }
+}
+"#,
+        );
+        assert!(
+            !diags
+                .iter()
+                .any(|(code, _)| *code == DiagnosticCode::UnresolvedMethod),
+            "{diags:?}"
+        );
+    }
+
     #[test]
     fn annotations_outside_their_target() {
         let diags = check(
@@ -2287,6 +2480,41 @@ class Main {
         assert_eq!(unresolved, ["Missing", "Nope"], "{diags:?}");
     }
 
+    #[test]
+    fn unresolved_annotation_names() {
+        let diags = check(
+            r#"
+@EnableFeignClients
+class Main {
+    @interface Marker {}
+
+    @Marker
+    int marked;
+
+    @Override
+    public String toString() { return ""; }
+
+    @Missing
+    @Deprecated
+    void run(@Nope int x) {}
+
+    @no.such.Thing
+    int ok;
+}
+"#,
+        );
+        let unresolved: Vec<&str> = diags
+            .iter()
+            .filter(|(code, _)| *code == DiagnosticCode::UnresolvedType)
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(
+            unresolved,
+            ["EnableFeignClients", "Missing", "Nope"],
+            "{diags:?}"
+        );
+    }
+
     /// 每个文件里错误级的诊断（提示和警告不算）。
     fn errors_in_all_files(text: &str) -> Vec<(String, DiagnosticCode, String)> {
         let fx = fixture(text);
@@ -2575,5 +2803,37 @@ class Main {
 "#,
         );
         assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    /// 菱形构造选中 `Req(MV<String, String>, ...)` 而不是 `Req(T, ...)`：`T` 由目标类型定成
+    /// `Void`，不能按 `T = H` 报类型不匹配。javac 编译无警告。
+    #[test]
+    fn diamond_overload_choice_does_not_fix_the_type_argument() {
+        let diags = check(
+            r#"
+import java.util.HashMap;
+
+public class Main {
+    interface MV<K, V> extends java.util.Map<K, V> {}
+
+    static class H extends HashMap<String, String> implements MV<String, String> {}
+
+    static class Req<T> {
+        Req(T body, String method, String url) {}
+        Req(MV<String, String> headers, String method, String url) {}
+    }
+
+    void f() {
+        H h = new H();
+        Req<Void> r = new Req<>(h, "GET", "u");
+    }
+}
+"#,
+        );
+        let mismatches: Vec<_> = diags
+            .iter()
+            .filter(|(code, _)| *code == DiagnosticCode::TypeMismatch)
+            .collect();
+        assert!(mismatches.is_empty(), "{diags:?}");
     }
 }
