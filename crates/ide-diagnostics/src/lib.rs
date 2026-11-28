@@ -703,6 +703,9 @@ fn unresolved_types(view: &View<'_>, out: &mut Vec<Diagnostic>) {
             continue;
         }
         let scope = sema.type_scope(file, &node);
+        if name == "__" && is_lombok_onx_placeholder(db, &scope, &node) {
+            continue;
+        }
         // 同一个作用域里同一个名字只解析一次
         let resolved = *resolved_names
             .entry((scope, name.clone()))
@@ -762,6 +765,47 @@ fn unresolved_types(view: &View<'_>, out: &mut Vec<Diagnostic>) {
             unused: false,
         });
     }
+}
+
+/// Lombok 的 javac7 onX 写法：构造器注解的 `onConstructor`，Getter/Setter/With/Wither/WithBy
+/// 的 `onMethod`，以及 Setter/With/Wither/EqualsAndHashCode 的 `onParam`。
+/// Lombok 在 javac 解析注解类型前移除 `@__` 包装，因此 `__` 无需解析。
+fn is_lombok_onx_placeholder(db: &dyn Db, scope: &hir::TypeScope, node: &SyntaxNode) -> bool {
+    let Some(arg) = node.parent().and_then(ast::AnnotationArg::cast) else {
+        return false;
+    };
+    let Some(key) = arg.name_ref() else {
+        return false;
+    };
+    let Some(owner) = arg
+        .syntax()
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(ast::Annotation::cast)
+    else {
+        return false;
+    };
+    let Some(name) = owner.name() else {
+        return false;
+    };
+    let Some(hir::TypeNs::Class(class)) = hir::resolve_type_path(db, scope, &name.segments())
+    else {
+        return false;
+    };
+    matches!(
+        (class.binary_name(db).as_str(), key.text().as_str()),
+        (
+            "lombok/RequiredArgsConstructor"
+                | "lombok/AllArgsConstructor"
+                | "lombok/NoArgsConstructor",
+            "onConstructor"
+        ) | ("lombok/Getter" | "lombok/experimental/WithBy", "onMethod")
+            | (
+                "lombok/Setter" | "lombok/With" | "lombok/experimental/Wither",
+                "onMethod" | "onParam"
+            )
+            | ("lombok/EqualsAndHashCode", "onParam")
+    )
 }
 
 /// 节点在没有登记成类的匿名类（菱形 `new T<>() { ... }`、`outer.new Inner() { ... }`）
@@ -2512,6 +2556,62 @@ class Main {
             unresolved,
             ["EnableFeignClients", "Missing", "Nope"],
             "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn lombok_onx_placeholder_is_not_an_unresolved_type() {
+        let errors = errors_in_all_files(
+            r#"
+//- /lombok/RequiredArgsConstructor.java
+package lombok;
+public @interface RequiredArgsConstructor {}
+//- /lombok/Getter.java
+package lombok;
+public @interface Getter {}
+//- /lombok/Setter.java
+package lombok;
+public @interface Setter {}
+//- /app/Main.java
+package app;
+import lombok.RequiredArgsConstructor;
+import lombok.*;
+
+@RequiredArgsConstructor(onConstructor = @__(@Inject))
+class Main {
+    @interface Inject {}
+
+    @Getter(onMethod = @__({@Deprecated}))
+    @lombok.Setter(onParam = @__(@Inject))
+    String name;
+
+    @RequiredArgsConstructor(onConstructor_ = @Inject)
+    static class Modern {}
+
+    @Getter(onMethod = @__(@Missing))
+    String invalid;
+
+    @Getter(onParam = @__(@Inject))
+    String wrongArgument;
+
+    @interface Other {}
+    @Other(onMethod = @__(@Inject))
+    String wrongAnnotation;
+
+    @__ String ordinary;
+    __ type;
+}
+"#,
+        );
+        let unresolved: Vec<&str> = errors
+            .iter()
+            .filter(|(_, code, _)| *code == DiagnosticCode::UnresolvedType)
+            .map(|(_, _, text)| text.as_str())
+            .collect();
+        assert_eq!(
+            unresolved,
+            ["Missing", "__", "__", "__", "__"],
+            "{errors:?}"
         );
     }
 
