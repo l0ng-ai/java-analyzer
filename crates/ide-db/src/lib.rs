@@ -7,6 +7,7 @@ pub mod editorconfig;
 pub mod fuzzy;
 pub mod imports;
 pub mod javadoc;
+pub mod overrides;
 pub mod render;
 pub mod search;
 pub mod spring;
