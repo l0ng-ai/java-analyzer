@@ -3129,6 +3129,37 @@ class Main {
         assert!(errors.is_empty(), "{errors:#?}");
     }
 
+    /// 菱形构造作实参，形参是有上界的方法类型变量（`<T extends Collection<String>> T f(T)`）：
+    /// 菱形的类型实参由形参推断，`new TreeSet<>(Comparator<CharSequence>)` 推成
+    /// `TreeSet<String>`，不能按构造器实参得到的 `TreeSet<CharSequence>` 判断违反上界。javac 编译通过。
+    #[test]
+    fn diamond_argument_is_inferred_against_the_bounded_parameter() {
+        let diags = check(
+            r#"
+public class Main {
+    static class Base {}
+    static class Sub extends Base {}
+    interface Cmp<T> {}
+    interface Coll<E> { void add(E e); }
+    static class Tree<E> implements Coll<E> {
+        Tree(Cmp<? super E> cmp) {}
+        public void add(E e) {}
+    }
+
+    static <T extends Coll<Sub>> T findAll(Sub s, T collection) {
+        collection.add(s);
+        return collection;
+    }
+
+    Coll<Sub> f(Cmp<Base> cmp) {
+        return findAll(new Sub(), new Tree<>(cmp));
+    }
+}
+"#,
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
     /// 菱形构造选中 `Req(MV<String, String>, ...)` 而不是 `Req(T, ...)`：`T` 由目标类型定成
     /// `Void`，不能按 `T = H` 报类型不匹配。javac 编译无警告。
     #[test]

@@ -30,15 +30,20 @@ pub(super) enum Value {
     Package(String),
 }
 
+/// `new Foo<>(...)`：菱形构造（可以带类体）。
+fn is_diamond_new(arg: &ast::Expr) -> bool {
+    match arg {
+        ast::Expr::ParenExpr(paren) => paren.expr().is_some_and(|e| is_diamond_new(&e)),
+        ast::Expr::NewExpr(new) => new
+            .ty()
+            .is_some_and(|ty| ty.syntax().text().to_string().ends_with("<>")),
+        _ => false,
+    }
+}
+
 /// `new Foo<>() { ... }`：带类体的菱形构造。
 fn is_diamond_anonymous(arg: &ast::Expr) -> bool {
-    let ast::Expr::NewExpr(new) = arg else {
-        return false;
-    };
-    new.body().is_some()
-        && new
-            .ty()
-            .is_some_and(|ty| ty.syntax().text().to_string().ends_with("<>"))
+    matches!(arg, ast::Expr::NewExpr(new) if new.body().is_some()) && is_diamond_new(arg)
 }
 
 /// 方法引用（`Foo::bar`、`Foo::new`）在同名候选里选中的那一个：函数类型的形参个数对得上、
@@ -2233,10 +2238,23 @@ impl InferCtx<'_> {
         if arity_never_matches {
             return true;
         }
-        // 每个候选要么参数个数对不上，要么按实参推出的类型参数确定违反了上界
+        // 每个候选要么参数个数对不上，要么按实参推出的类型参数确定违反了上界。菱形构造的
+        // 类型实参要和形参一起推断（`new TreeSet<>(cmp)` 传给 `T extends Collection<String>`
+        // 时是 `TreeSet<String>`），单独推出的类型不能拿来判断上界
+        let bound_args: Vec<Arg> = args
+            .iter()
+            .zip(arg_exprs)
+            .map(|(arg, expr)| {
+                if is_diamond_new(expr) {
+                    Arg::Ty(Ty::Unknown)
+                } else {
+                    arg.clone()
+                }
+            })
+            .collect();
         let violates_bounds = sigs.iter().all(|(candidate, sig)| {
             (!sig.varargs && sig.params.len() != args.len())
-                || certainly_violates_bounds(db, candidate, args)
+                || certainly_violates_bounds(db, candidate, &bound_args)
         });
         if violates_bounds {
             return true;
