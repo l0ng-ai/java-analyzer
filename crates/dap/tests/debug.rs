@@ -640,6 +640,341 @@ fn evaluate_method_calls_operators_and_conditions() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+const FIELDS_JAVA: &str = r#"package demo;
+
+public class Fields {
+    static class Base {
+        int x = 1;
+        static int S = 10;
+        int seen() { return x; }
+    }
+
+    static class Derived extends Base {
+        int x = 2;
+        static int S = 20;
+        int runtimeOnly = 78;
+    }
+
+    public static void main(String[] args) {
+        Derived derived = new Derived();
+        Base base = derived;
+        System.out.println("stop");
+        base.seen();
+    }
+}
+"#;
+
+/// 字段不按运行时类型分派：隐藏字段由表达式的静态类型决定，静态字段不读接收者。
+#[test]
+fn evaluate_fields_use_the_static_type() {
+    let jdk = require_jdk!();
+    let dir = temp_dir("fields");
+    let source = dir.join("src/demo/Fields.java");
+    write(&source, FIELDS_JAVA);
+    let out = dir.join("out");
+    javac(&jdk, &out, &[&source]);
+
+    let mut client = Client::start();
+    client.request(
+        "launch",
+        json!({
+            "mainClass": "demo.Fields",
+            "projectRoot": dir,
+            "classPaths": [out],
+            "javaExec": java(&jdk),
+        }),
+    );
+    client.wait_event("initialized");
+    client.request(
+        "setBreakpoints",
+        json!({"source": {"path": source}, "breakpoints": [{"line": 20}, {"line": 7}]}),
+    );
+    client.request("configurationDone", json!({}));
+    let thread = client.wait_stopped("breakpoint");
+    let (frame, _, line, _) = client.top_frame(thread);
+    assert_eq!(line, 20);
+
+    assert_eq!(client.evaluate(frame, "derived.x"), "2");
+    assert_eq!(client.evaluate(frame, "base.x"), "1");
+    assert_eq!(client.evaluate(frame, "((Base) derived).x"), "1");
+    assert_eq!(client.evaluate(frame, "((Derived) base).x"), "2");
+    assert_eq!(client.evaluate(frame, "derived.S"), "20");
+    assert_eq!(client.evaluate(frame, "base.S"), "10");
+    // 静态字段不读接收者，null 也行
+    assert_eq!(client.evaluate(frame, "((Base) null).S"), "10");
+    // 实例字段通过 null 仍然是 NullPointerException
+    assert!(evaluate_error(&mut client, frame, "((Base) null).x").contains("NullPointerException"));
+
+    // 父类方法里，简单名字 `x` 和 `this.x` 都是 `Base.x`，`this` 的运行时类型是 Derived 也一样
+    client.request("continue", json!({"threadId": thread}));
+    let thread = client.wait_stopped("breakpoint");
+    let (frame, _, line, _) = client.top_frame(thread);
+    assert_eq!(line, 7);
+    assert_eq!(client.evaluate(frame, "x"), "1");
+    assert_eq!(client.evaluate(frame, "this.x"), "1");
+    assert_eq!(client.evaluate(frame, "S"), "10");
+    // 词法上找不到的名字才退回运行时类型：子类才有的字段在监视里照样读得到
+    assert_eq!(client.evaluate(frame, "runtimeOnly"), "78");
+
+    client.request("continue", json!({"threadId": thread}));
+    client.wait_event("terminated");
+    client.finish();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+const LOADER_JAVA: &str = r#"package demo;
+
+import java.io.File;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.util.ArrayList;
+import java.util.List;
+
+public class Loader {
+    public static void main(String[] args) throws Exception {
+        URL[] urls = {new File(args[0]).toURI().toURL()};
+        // 两份 Plugin 先都载入，再依次调用
+        List<Class<?>> plugins = new ArrayList<>();
+        for (int value : new int[] {101, 202}) {
+            Class<?> plugin = new URLClassLoader(urls).loadClass("separate.Plugin");
+            plugin.getField("S").setInt(null, value);
+            plugins.add(plugin);
+        }
+        for (Class<?> plugin : plugins) {
+            plugin.getMethod("stop").invoke(plugin.getDeclaredConstructor().newInstance());
+        }
+    }
+}
+"#;
+
+const PLUGIN_JAVA: &str = r#"package separate;
+public class Plugin {
+    public static int S;
+    public void stop() {
+        Plugin p = this;
+        System.out.println(p.S);
+    }
+}
+"#;
+
+/// 同名的类由两个 ClassLoader 各载入一份：静态字段要读当前对象自己那份，不是 JVM 里同名的第一个。
+#[test]
+fn evaluate_static_fields_with_the_same_class_in_two_class_loaders() {
+    let jdk = require_jdk!();
+    let dir = temp_dir("loaders");
+    let loader = dir.join("src/demo/Loader.java");
+    let plugin = dir.join("src/separate/Plugin.java");
+    write(&loader, LOADER_JAVA);
+    write(&plugin, PLUGIN_JAVA);
+    let out = dir.join("out");
+    // Plugin 不在启动类路径上，只由 Loader 里的两个 URLClassLoader 载入
+    let plugins = dir.join("plugins");
+    javac(&jdk, &out, &[&loader]);
+    javac(&jdk, &plugins, &[&plugin]);
+
+    let mut client = Client::start();
+    client.request(
+        "launch",
+        json!({
+            "mainClass": "demo.Loader",
+            "projectRoot": dir,
+            "classPaths": [out],
+            "args": [plugins],
+            "javaExec": java(&jdk),
+        }),
+    );
+    client.wait_event("initialized");
+    client.request(
+        "setBreakpoints",
+        json!({"source": {"path": plugin}, "breakpoints": [{"line": 6}]}),
+    );
+    client.request("configurationDone", json!({}));
+    for expected in ["101", "202"] {
+        let thread = client.wait_stopped("breakpoint");
+        let (frame, _, line, _) = client.top_frame(thread);
+        assert_eq!(line, 6);
+        for expression in ["p.S", "this.S", "S"] {
+            assert_eq!(client.evaluate(frame, expression), expected, "{expression}");
+        }
+        client.request("continue", json!({"threadId": thread}));
+    }
+    client.wait_event("terminated");
+    client.finish();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+const NULL_LOADER_JAVA: &str = r#"package demo;
+
+import java.io.File;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.util.ArrayList;
+import java.util.List;
+
+public class NullLoader {
+    public static void main(String[] args) throws Exception {
+        URL plugins = new File(args[0]).toURI().toURL();
+        URL callers = new File(args[1]).toURI().toURL();
+        // 两个父 ClassLoader 各定义一份 separate.Plugin，Caller 由它们各自的子 ClassLoader 载入
+        List<Class<?>> loaded = new ArrayList<>();
+        for (int value : new int[] {101, 202}) {
+            URLClassLoader parent = new URLClassLoader(new URL[] {plugins});
+            parent.loadClass("separate.Plugin").getField("S").setInt(null, value);
+            loaded.add(new URLClassLoader(new URL[] {callers}, parent).loadClass("caller.Caller"));
+        }
+        for (Class<?> caller : loaded) {
+            caller.getMethod("stop").invoke(caller.getDeclaredConstructor().newInstance());
+        }
+    }
+}
+"#;
+
+const CALLER_JAVA: &str = r#"package caller;
+
+import separate.Plugin;
+
+public class Caller {
+    public void stop() {
+        Plugin p = null;
+        Plugin q = new Plugin();
+        System.out.println(q.S);
+    }
+}
+"#;
+
+/// 接收者是 null、同名的类有两份时，不能读到另一份的静态字段：认不出是哪一份就报错。
+#[test]
+fn evaluate_static_field_through_null_with_two_classes_of_the_same_name() {
+    let jdk = require_jdk!();
+    let dir = temp_dir("null-loaders");
+    let main = dir.join("src/demo/NullLoader.java");
+    let plugin = dir.join("src/separate/Plugin.java");
+    let caller = dir.join("src/caller/Caller.java");
+    write(&main, NULL_LOADER_JAVA);
+    write(&plugin, PLUGIN_JAVA);
+    write(&caller, CALLER_JAVA);
+    let out = dir.join("out");
+    javac(&jdk, &out, &[&main]);
+    // Plugin 和 Caller 一起编译，再拆到两个目录里：启动类路径上都没有它们
+    let all = dir.join("all");
+    javac(&jdk, &all, &[&plugin, &caller]);
+    let (plugins, callers) = (dir.join("plugins"), dir.join("callers"));
+    for (from, to, file) in [
+        ("separate", &plugins, "Plugin.class"),
+        ("caller", &callers, "Caller.class"),
+    ] {
+        std::fs::create_dir_all(to.join(from)).unwrap();
+        std::fs::copy(all.join(from).join(file), to.join(from).join(file)).unwrap();
+    }
+
+    let mut client = Client::start();
+    client.request(
+        "launch",
+        json!({
+            "mainClass": "demo.NullLoader",
+            "projectRoot": dir,
+            "classPaths": [out],
+            "args": [plugins, callers],
+            "javaExec": java(&jdk),
+        }),
+    );
+    client.wait_event("initialized");
+    client.request(
+        "setBreakpoints",
+        json!({"source": {"path": caller}, "breakpoints": [{"line": 9}]}),
+    );
+    client.request("configurationDone", json!({}));
+    for expected in ["101", "202"] {
+        let thread = client.wait_stopped("breakpoint");
+        let (frame, _, line, _) = client.top_frame(thread);
+        assert_eq!(line, 9);
+        // 非 null 的接收者认得出是哪一份
+        assert_eq!(client.evaluate(frame, "q.S"), expected);
+        // null 的认不出：报错可以，值必须不是另一份的
+        let response = client.response(
+            "evaluate",
+            json!({"expression": "p.S", "frameId": frame, "context": "watch"}),
+        );
+        if response["success"] == json!(true) {
+            assert_eq!(response["body"]["result"], json!(expected), "{response}");
+        }
+        client.request("continue", json!({"threadId": thread}));
+    }
+    client.wait_event("terminated");
+    client.finish();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+const LAZY_JAVA: &str = r#"package demo;
+
+public class Lazy {
+    static boolean inited = false;
+
+    static class Target {
+        static int S = 17;
+        int x = 3;
+
+        static {
+            Lazy.inited = true;
+        }
+    }
+
+    public static void main(String[] args) {
+        Target target = null;
+        System.out.println("stop");
+    }
+}
+"#;
+
+/// 读 null 接收者的字段不能为了认出它的类型去载入、初始化还没载入的类：Java 里 `target.x` 只抛
+/// NPE，不会运行静态初始化器。
+#[test]
+fn evaluate_field_through_null_does_not_initialize_the_class() {
+    let jdk = require_jdk!();
+    let dir = temp_dir("lazy");
+    let source = dir.join("src/demo/Lazy.java");
+    write(&source, LAZY_JAVA);
+    let out = dir.join("out");
+    javac(&jdk, &out, &[&source]);
+
+    let mut client = Client::start();
+    client.request(
+        "launch",
+        json!({
+            "mainClass": "demo.Lazy",
+            "projectRoot": dir,
+            "classPaths": [out],
+            "javaExec": java(&jdk),
+        }),
+    );
+    client.wait_event("initialized");
+    client.request(
+        "setBreakpoints",
+        json!({"source": {"path": source}, "breakpoints": [{"line": 17}]}),
+    );
+    client.request("configurationDone", json!({}));
+    let thread = client.wait_stopped("breakpoint");
+    let (frame, _, line, _) = client.top_frame(thread);
+    assert_eq!(line, 17);
+    assert_eq!(client.evaluate(frame, "inited"), "false");
+    for expression in ["target.x", "target.S"] {
+        let response = client.response(
+            "evaluate",
+            json!({"expression": expression, "frameId": frame, "context": "watch"}),
+        );
+        assert_eq!(
+            response["success"],
+            json!(false),
+            "{expression}: {response}"
+        );
+        assert_eq!(client.evaluate(frame, "inited"), "false", "{expression}");
+    }
+    client.request("continue", json!({"threadId": thread}));
+    client.wait_event("terminated");
+    client.finish();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn launch_maven_project_without_class_paths() {
     let jdk = require_jdk!();
