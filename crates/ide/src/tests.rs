@@ -192,6 +192,42 @@ class Main {
 }
 
 #[test]
+fn hover_shows_type_parameter_docs() {
+    let cases = [
+        (
+            r#"
+class Main {
+    /**
+     * @param <E> the {@link List}'s element type
+     * @param e1 the element
+     */
+    static <E> E first(E e1) { return e1; }
+    void f() { fi$0rst("x"); }
+}
+"#,
+            "- `<E>` — the `List`'s element type\n- `e1` — the element",
+        ),
+        (
+            r#"
+/**
+ * @param <T> the value type
+ * @param <U>
+ */
+class Box<T, U> {}
+class Main { Bo$0x<String, Integer> box; }
+"#,
+            "- `<T>` — the value type\n- `<U>`",
+        ),
+    ];
+    for (source, expected) in cases {
+        let fx = fixture(source);
+        let result = hover::hover(&fx.db, position(&fx)).unwrap();
+        let docs = result.info.docs.as_deref().unwrap();
+        assert!(docs.contains(expected), "{docs}");
+    }
+}
+
+#[test]
 fn hover_inherits_docs_from_overridden_method() {
     let fx = fixture(
         r#"
