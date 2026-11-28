@@ -29,7 +29,10 @@ reported. The gaps below are known and deliberate trade-offs or not yet implemen
   ignored. YAML without anchors or flow syntax; keys below `List<Pojo>` / `Map<String, Pojo>` are
   not completed or checked. HTTP client interfaces are linked to shared contracts by simple name.
 - **Projects**: Gradle build scripts are not analyzed; Eclipse projects in different workspace
-  roots are not linked to each other; generated sources are not split into main and test. Duplicate classes on the class
+  roots are not linked to each other; generated sources are not split into main and test. Maven
+  version ranges resolve against versions already in the local repository; nearest-wins arbitration
+  does not re-check hard ranges (direct `lib:1.0` vs transitive `lib:[1.1,2.0)` keeps 1.0); remote
+  metadata is not consulted until the Maven fetch fallback runs. Duplicate classes on the class
   path use the first jar's copy for stubs and subtype tables, and Spring configuration files
   resolve types globally. Source files that are not open in the editor are decoded with their
   module's source encoding, except that a file which is valid UTF-8 is always read as UTF-8 (many

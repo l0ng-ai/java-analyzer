@@ -10,6 +10,7 @@
 //! 版本区间的完整语义、命令行 `-P` / `-D` 激活的 profile、改变源码目录的插件。
 
 use std::{
+    cmp::Ordering,
     collections::VecDeque,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
@@ -516,19 +517,148 @@ fn interpolate_dep(dep: &RawDep, properties: &FxHashMap<String, String>) -> RawD
     }
 }
 
-/// 版本区间 `[1.0,2.0)` 没有完整实现：取其中出现的第一个版本号。
-fn normalize_version(version: &str) -> String {
-    if version.starts_with('[') || version.starts_with('(') {
-        version
-            .trim_matches(|c| matches!(c, '[' | ']' | '(' | ')'))
-            .split(',')
-            .map(str::trim)
-            .find(|part| !part.is_empty())
-            .unwrap_or_default()
-            .to_owned()
-    } else {
-        version.to_owned()
+/// 区间的一端：（版本，是否包含它）；`None` 是没有这一端（`(,1.0]`、`[1.0,)`）。
+type RangeBound = Option<(String, bool)>;
+
+/// 解析版本区间：`[1.0,2.0)`、`(,1.0]`、`[1.0]`、并集 `[1,2),(3,)`。不是区间时返回 `None`。
+/// 并集只在 `],` / `),` 处分开，每段里的逗号是上下界的分隔。
+fn parse_range(spec: &str) -> Option<Vec<(RangeBound, RangeBound)>> {
+    let mut rest = spec.trim();
+    if !rest.starts_with(['[', '(']) {
+        return None;
     }
+    let bound = |v: &str, inclusive: bool| {
+        let v = v.trim();
+        (!v.is_empty()).then(|| (v.to_owned(), inclusive))
+    };
+    let mut ranges = Vec::new();
+    while !rest.is_empty() {
+        let lower_inclusive = match rest.as_bytes()[0] {
+            b'[' => true,
+            b'(' => false,
+            _ => return None,
+        };
+        let end = rest.find([']', ')'])?;
+        let upper_inclusive = rest.as_bytes()[end] == b']';
+        let inner = &rest[1..end];
+        ranges.push(match inner.split_once(',') {
+            Some((lower, upper)) => (bound(lower, lower_inclusive), bound(upper, upper_inclusive)),
+            // `[1.0]`：恰好是这个版本
+            None => {
+                let pin = bound(inner, true)?;
+                (Some(pin.clone()), Some(pin))
+            }
+        });
+        rest = rest[end + 1..].trim_start();
+        rest = rest.strip_prefix(',').unwrap_or(rest).trim_start();
+    }
+    Some(ranges)
+}
+
+fn in_range(version: &str, (lower, upper): &(RangeBound, RangeBound)) -> bool {
+    let above = lower
+        .as_ref()
+        .is_none_or(|(v, inclusive)| match compare_versions(version, v) {
+            Ordering::Greater => true,
+            Ordering::Equal => *inclusive,
+            Ordering::Less => false,
+        });
+    let below = upper
+        .as_ref()
+        .is_none_or(|(v, inclusive)| match compare_versions(version, v) {
+            Ordering::Less => true,
+            Ordering::Equal => *inclusive,
+            Ordering::Greater => false,
+        });
+    above && below
+}
+
+enum VersionToken {
+    /// 去掉前导零的数字
+    Number(String),
+    /// 小写的限定词
+    Qualifier(String),
+}
+
+impl VersionToken {
+    /// 等同于没有这一项的：`0`、`ga`、`final`、`release`
+    fn is_null(&self) -> bool {
+        match self {
+            VersionToken::Number(n) => n.is_empty(),
+            VersionToken::Qualifier(q) => qualifier_rank(q).0 == 5,
+        }
+    }
+}
+
+/// 限定词的顺序：alpha < beta < milestone < rc < snapshot < 正式版 < sp < 其它（按字母）。
+fn qualifier_rank(qualifier: &str) -> (u8, &str) {
+    match qualifier {
+        "alpha" | "a" => (0, ""),
+        "beta" | "b" => (1, ""),
+        "milestone" | "m" => (2, ""),
+        "rc" | "cr" => (3, ""),
+        "snapshot" => (4, ""),
+        "" | "ga" | "final" | "release" => (5, ""),
+        "sp" => (6, ""),
+        other => (7, other),
+    }
+}
+
+/// 按 `.`、`-` 和数字/字母的交界切分；限定词前面和末尾等同于没有的项去掉（`1.0-rc` == `1-rc`，`1.0` == `1`）。
+fn version_tokens(version: &str) -> Vec<VersionToken> {
+    let mut tokens = Vec::new();
+    let lower = version.to_ascii_lowercase();
+    let push = |tokens: &mut Vec<VersionToken>, part: &str| {
+        let token = if part.starts_with(|c: char| c.is_ascii_digit()) {
+            VersionToken::Number(part.trim_start_matches('0').to_owned())
+        } else {
+            while tokens.last().is_some_and(VersionToken::is_null) {
+                tokens.pop();
+            }
+            VersionToken::Qualifier(part.to_owned())
+        };
+        tokens.push(token);
+    };
+    for part in lower.split(['.', '-']) {
+        let mut start = 0;
+        let bytes = part.as_bytes();
+        for i in 1..bytes.len() {
+            if bytes[i].is_ascii_digit() != bytes[i - 1].is_ascii_digit() {
+                push(&mut tokens, &part[start..i]);
+                start = i;
+            }
+        }
+        push(&mut tokens, &part[start..]);
+    }
+    while tokens.last().is_some_and(VersionToken::is_null) {
+        tokens.pop();
+    }
+    tokens
+}
+
+/// 比较两个 Maven 版本号。
+// shortcut: not full GenericVersionScheme (unknown-qualifier and padding edge cases); upgrade if a real project mis-orders
+fn compare_versions(a: &str, b: &str) -> Ordering {
+    use VersionToken::{Number, Qualifier};
+    let (a, b) = (version_tokens(a), version_tokens(b));
+    for i in 0..a.len().max(b.len()) {
+        let ordering = match (a.get(i), b.get(i)) {
+            (Some(Number(x)), Some(Number(y))) => x.len().cmp(&y.len()).then_with(|| x.cmp(y)),
+            (Some(Number(_)), Some(Qualifier(_))) => Ordering::Greater,
+            (Some(Qualifier(_)), Some(Number(_))) => Ordering::Less,
+            (Some(Qualifier(x)), Some(Qualifier(y))) => qualifier_rank(x).cmp(&qualifier_rank(y)),
+            // 短的一方缺的项当作 `0` / 正式版
+            (Some(Number(x)), None) => (!x.is_empty()).cmp(&false),
+            (None, Some(Number(y))) => false.cmp(&!y.is_empty()),
+            (Some(Qualifier(x)), None) => qualifier_rank(x).cmp(&qualifier_rank("")),
+            (None, Some(Qualifier(y))) => qualifier_rank("").cmp(&qualifier_rank(y)),
+            (None, None) => Ordering::Equal,
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    Ordering::Equal
 }
 
 fn parse_scope(scope: Option<&str>) -> Scope {
@@ -584,6 +714,53 @@ struct Resolver {
 }
 
 impl Resolver {
+    /// 依赖声明里的版本。区间（`[1.0,2.0)`）和 Maven 一样取落在区间里的最高版本，候选只看本地仓库里的
+    /// 版本目录（不读 `maven-metadata*.xml`）：优先取目录里有依赖要用的文件 `{artifact}-{v}{suffix}`
+    /// （见 `artifact_suffix`）的最高版本，避免离线或远程仓库不可达时因别的工程留下的纯 pom 目录顶掉已有构件；
+    /// 区间里没有任何版本有构件文件时，退而取有 `.pom` 的最高版本（展开已安装的传递依赖并按缺件
+    /// 交给 Maven 补下载）；只有 `*.lastUpdated` 的目录不算候选；一个都没有时原样返回区间，
+    /// 交给 Maven 自己按区间下载。软性版本（`1.0`）原样返回。
+    fn resolve_version(&self, group: &str, artifact: &str, spec: &str, suffix: &str) -> String {
+        let Some(ranges) = parse_range(spec) else {
+            return spec.to_owned();
+        };
+        if let [(Some((lower, true)), Some((upper, true)))] = ranges.as_slice() {
+            if lower == upper {
+                return lower.clone();
+            }
+        }
+        let coord = Coord {
+            group: group.to_owned(),
+            artifact: artifact.to_owned(),
+        };
+        if self.reactor.contains_key(&coord) {
+            // reactor 里的模块不看本地仓库，版本号也用不上：照旧取第一个界
+            return ranges
+                .first()
+                .and_then(|(lower, upper)| lower.as_ref().or(upper.as_ref()))
+                .map_or_else(|| spec.to_owned(), |(v, _)| v.clone());
+        }
+        let dir = self.repo.join(group.replace('.', "/")).join(artifact);
+        let in_range_versions: Vec<String> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|v| ranges.iter().any(|range| in_range(v, range)))
+            .collect();
+        let highest_with = |ext: &str| {
+            in_range_versions
+                .iter()
+                .filter(|v| dir.join(v).join(format!("{artifact}-{v}{ext}")).is_file())
+                // `1.0` 和 `1.0.0` 相等时按字符串定下来，不受目录顺序影响
+                .max_by(|a, b| compare_versions(a, b).then_with(|| a.cmp(b)))
+                .cloned()
+        };
+        highest_with(suffix)
+            .or_else(|| (suffix != ".pom").then(|| highest_with(".pom")).flatten())
+            .unwrap_or_else(|| spec.to_owned())
+    }
+
     fn artifact_dir(&self, group: &str, artifact: &str, version: &str) -> PathBuf {
         self.repo
             .join(group.replace('.', "/"))
@@ -747,7 +924,11 @@ impl Resolver {
                 });
         }
         for bom in boms {
-            let Some(version) = bom.version.as_deref().map(normalize_version) else {
+            let Some(version) = bom
+                .version
+                .as_deref()
+                .map(|v| self.resolve_version(&bom.group, &bom.artifact, v, ".pom"))
+            else {
                 continue;
             };
             let path = self.pom_for(&bom.coord(), &version);
@@ -933,7 +1114,11 @@ impl Resolver {
                 .map(|v| interpolate(&v, &root.properties))
                 .or_else(|| transitive.version.clone())
                 .or_else(|| own_managed.and_then(|m| m.version.clone()))
-                .map(|v| normalize_version(&interpolate(&v, &dep_pom.properties)));
+                .map(|v| {
+                    let v = interpolate(&v, &dep_pom.properties);
+                    let suffix = artifact_suffix(transitive);
+                    self.resolve_version(&transitive.group, &transitive.artifact, &v, &suffix)
+                });
             let Some(version) = version else { continue };
 
             let mut exclusions = (*pending.exclusions).clone();
@@ -980,7 +1165,11 @@ impl Resolver {
                 .version
                 .clone()
                 .or_else(|| managed.and_then(|m| m.version.clone()))
-                .map(|v| normalize_version(&interpolate(&v, &root.properties)))
+                .map(|v| {
+                    let v = interpolate(&v, &root.properties);
+                    let suffix = artifact_suffix(dep);
+                    self.resolve_version(&dep.group, &dep.artifact, &v, &suffix)
+                })
             else {
                 self.messages.push(base_db::tr!(
                     "{}:{} 没有版本号（{}）",
@@ -1087,22 +1276,20 @@ impl Resolver {
                 });
             } else if kind != "pom" {
                 let dir = self.artifact_dir(&coord.group, &coord.artifact, &pending.version);
-                let classifier = match (&pending.dep.classifier, kind) {
-                    (Some(c), _) => format!("-{c}"),
-                    (None, "test-jar") => "-tests".to_owned(),
-                    _ => String::new(),
-                };
                 let stem = format!("{}-{}", coord.artifact, pending.version);
-                let jar = dir.join(format!("{stem}{classifier}.jar"));
-                if jar.is_file() {
-                    let sources = dir.join(format!("{stem}-sources.jar"));
-                    result.push(ResolvedDep::Library {
-                        name: format!("{}:{}:{}", coord.group, coord.artifact, pending.version),
-                        jar,
-                        sources: sources.is_file().then_some(sources),
-                        scope: pending.scope,
-                        version: pending.version.clone(),
-                    });
+                let suffix = artifact_suffix(&pending.dep);
+                let file = dir.join(format!("{stem}{suffix}"));
+                if file.is_file() {
+                    if suffix.ends_with(".jar") {
+                        let sources = dir.join(format!("{stem}-sources.jar"));
+                        result.push(ResolvedDep::Library {
+                            name: format!("{}:{}:{}", coord.group, coord.artifact, pending.version),
+                            jar: file,
+                            sources: sources.is_file().then_some(sources),
+                            scope: pending.scope,
+                            version: pending.version.clone(),
+                        });
+                    }
                 } else {
                     self.note_missing(MissingArtifact {
                         group: coord.group.clone(),
@@ -1131,6 +1318,22 @@ impl Resolver {
             self.enqueue_transitives(root, &coord, &pending.version, &pending, &mut queue);
         }
         result
+    }
+}
+
+/// 依赖在本地仓库里的文件名去掉 `{artifact}-{version}` 之后的部分：`.pom`、`.jar`、`-tests.jar`、`.war`、`.zip`……
+/// 只有已知的非 jar 归档类型按类型名取扩展名，未知类型（如 `hk2-jar`、`bundle`）照旧按 `.jar` 查找。
+fn artifact_suffix(dep: &RawDep) -> String {
+    let kind = dep.kind.as_deref().unwrap_or("jar");
+    let ext = match kind {
+        "pom" => return ".pom".to_owned(),
+        "war" | "ear" | "rar" | "zip" | "tar.gz" | "tgz" | "aar" => kind,
+        _ => "jar",
+    };
+    match (&dep.classifier, kind) {
+        (Some(c), _) => format!("-{c}.{ext}"),
+        (None, "test-jar") => "-tests.jar".to_owned(),
+        _ => format!(".{ext}"),
     }
 }
 
@@ -3163,10 +3366,354 @@ The following files have been resolved:\n\
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 本地仓库里放 `g:{artifact}:{version}` 的 pom 和空 jar。
+    fn install_version(repo: &Path, artifact: &str, version: &str, body: &str) {
+        let dir = repo.join("g").join(artifact).join(version);
+        write(
+            &dir.join(format!("{artifact}-{version}.pom")),
+            &format!(
+                "<project><groupId>g</groupId><artifactId>{artifact}</artifactId>\
+                 <version>{version}</version>{body}</project>"
+            ),
+        );
+        write(&dir.join(format!("{artifact}-{version}.jar")), "");
+    }
+
+    /// 解析一个模块（`body` 是 `<project>` 里的内容）：返回 classpath 上的库（`g:a:v`）和解析器。
+    fn resolve_root(dir: &Path, repo: PathBuf, body: &str) -> (Vec<String>, Resolver) {
+        let root_pom = dir.join("app/pom.xml");
+        write(
+            &root_pom,
+            &format!(
+                "<project><groupId>g</groupId><artifactId>app</artifactId>\
+                 <version>1</version>{body}</project>"
+            ),
+        );
+        let mut resolver = resolver(repo);
+        let eff = resolver.effective(&root_pom, 0).unwrap();
+        let libs = resolver
+            .resolve_dependencies(&eff)
+            .into_iter()
+            .filter_map(|dep| match dep {
+                ResolvedDep::Library { name, jar, .. } => {
+                    assert!(jar.is_file());
+                    Some(name)
+                }
+                _ => None,
+            })
+            .collect();
+        (libs, resolver)
+    }
+
+    fn lib_dep(version: &str) -> String {
+        format!(
+            "<dependencies><dependency><groupId>g</groupId><artifactId>lib</artifactId>\
+             <version>{version}</version></dependency></dependencies>"
+        )
+    }
+
+    /// 区间取本地仓库里落在区间内的最高版本，不是下界。
+    #[test]
+    fn version_range_picks_highest_installed_version() {
+        let dir = temp_dir("range-highest");
+        let repo = dir.join("repo");
+        for v in ["0.9", "1.0", "1.1"] {
+            install_version(&repo, "lib", v, "");
+        }
+        let libs = |spec: &str| resolve_root(&dir, repo.clone(), &lib_dep(spec)).0;
+        assert_eq!(libs("[1.0,2.0)"), ["g:lib:1.1"]);
+        assert_eq!(libs("[1.0,1.1)"), ["g:lib:1.0"]);
+        assert_eq!(libs("(,1.0]"), ["g:lib:1.0"]);
+        // 硬性的单个版本和软性版本都不看仓库里有没有更高的
+        assert_eq!(libs("[1.0]"), ["g:lib:1.0"]);
+        assert_eq!(libs("1.0"), ["g:lib:1.0"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 下载失败只留下 `*.lastUpdated` 的版本目录不是候选，即使它是区间里最高的
+    /// （guava 经由 equinox.preferences 依赖 `org.osgi.service.prefs:[1.1.0,1.2.0)` 时就有这样的目录）。
+    #[test]
+    fn version_range_skips_versions_without_artifacts() {
+        let dir = temp_dir("range-osgi");
+        let repo = dir.join("repo");
+        let lib = repo.join("g/lib");
+        write(&lib.join("1.1.9/lib-1.1.9.jar.lastUpdated"), "");
+        write(&lib.join("1.1.9/lib-1.1.9.pom.lastUpdated"), "");
+        install_version(&repo, "lib", "1.1.1", "");
+        install_version(&repo, "lib", "1.1.2", "");
+        // 和 guava 一样经由传递依赖到达
+        install_version(&repo, "mid", "1", &lib_dep("[1.1.0,1.2.0)"));
+        let (libs, resolver) = resolve_root(
+            &dir,
+            repo,
+            "<dependencies><dependency><groupId>g</groupId><artifactId>mid</artifactId>\
+             <version>1</version></dependency></dependencies>",
+        );
+        assert_eq!(libs, ["g:mid:1", "g:lib:1.1.2"]);
+        assert!(resolver.messages.is_empty(), "{:?}", resolver.messages);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 候选版本得有依赖要用的那个文件：只有 pom 的 3.8.2 不能顶掉有 jar 的 3.8.1；
+    /// test-jar 依赖要的是 `-tests.jar`。
+    #[test]
+    fn version_range_requires_the_dependency_file() {
+        let dir = temp_dir("range-pom-only");
+        let repo = dir.join("repo");
+        install_version(&repo, "lib", "3.8.1", "");
+        install_version(&repo, "lib", "3.8.2", "");
+        std::fs::remove_file(repo.join("g/lib/3.8.2/lib-3.8.2.jar")).unwrap();
+        write(&repo.join("g/lib/3.8.1/lib-3.8.1-tests.jar"), "");
+        let (libs, resolver) = resolve_root(&dir, repo.clone(), &lib_dep("[3.8.1,3.8.3)"));
+        assert_eq!(libs, ["g:lib:3.8.1"]);
+        assert!(resolver.missing.is_empty(), "{:?}", resolver.missing);
+        assert!(resolver.messages.is_empty(), "{:?}", resolver.messages);
+        install_version(&repo, "lib", "3.8.2", "");
+        let (libs, resolver) = resolve_root(
+            &dir,
+            repo,
+            "<dependencies><dependency><groupId>g</groupId><artifactId>lib</artifactId>\
+             <version>[3.8.1,3.8.3)</version><type>test-jar</type></dependency></dependencies>",
+        );
+        assert_eq!(libs, ["g:lib:3.8.1"]);
+        assert!(resolver.missing.is_empty(), "{:?}", resolver.missing);
+        assert!(resolver.messages.is_empty(), "{:?}", resolver.messages);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 1.0 有 pom 和 jar，1.1 只有 pom（别的工程留下的）：区间 `[1.0,2.0)` 选已有 jar 的 1.0，
+    /// 不选只有 pom 的 1.1，不报缺件。
+    #[test]
+    fn version_range_skips_pom_only_higher_version() {
+        let dir = temp_dir("range-pom-only-1-1");
+        let repo = dir.join("repo");
+        install_version(&repo, "lib", "1.0", "");
+        install_version(&repo, "lib", "1.1", "");
+        std::fs::remove_file(repo.join("g/lib/1.1/lib-1.1.jar")).unwrap();
+        let (libs, resolver) = resolve_root(&dir, repo, &lib_dep("[1.0,2.0)"));
+        assert_eq!(libs, ["g:lib:1.0"]);
+        assert!(resolver.missing.is_empty(), "{:?}", resolver.missing);
+        assert!(resolver.messages.is_empty(), "{:?}", resolver.messages);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 区间也用在 zip 这类不是 jar 的依赖上：候选按 `.zip` 判断，只有 pom 的更高版本不算；
+    /// 选中 1.2 后不报缺件，照样读它的 pom、展开传递依赖。
+    #[test]
+    fn version_range_on_non_jar_type() {
+        let dir = temp_dir("range-zip");
+        let repo = dir.join("repo");
+        install_version(&repo, "lib", "1.0", "");
+        install_version(&repo, "dist", "1.2", &lib_dep("1.0"));
+        std::fs::remove_file(repo.join("g/dist/1.2/dist-1.2.jar")).unwrap();
+        write(&repo.join("g/dist/1.2/dist-1.2.zip"), "");
+        install_version(&repo, "dist", "1.3", "");
+        std::fs::remove_file(repo.join("g/dist/1.3/dist-1.3.jar")).unwrap();
+        let (libs, resolver) = resolve_root(
+            &dir,
+            repo,
+            "<dependencies><dependency><groupId>g</groupId><artifactId>dist</artifactId>\
+             <version>[1.0,2.0)</version><type>zip</type></dependency></dependencies>",
+        );
+        assert_eq!(libs, ["g:lib:1.0"]);
+        assert!(resolver.missing.is_empty(), "{:?}", resolver.missing);
+        assert!(resolver.messages.is_empty(), "{:?}", resolver.messages);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 区间里没有任何版本有 jar、但有已安装的 pom 时，退而选中最高版本的 pom：
+    /// 展开它已安装的传递依赖，同时仍把缺的 jar 报给 Maven 补下载。
+    #[test]
+    fn version_range_pom_only_fallback_expands_transitives() {
+        let dir = temp_dir("range-pom-only-transitives");
+        let repo = dir.join("repo");
+        install_version(&repo, "child", "1.0", "");
+        install_version(
+            &repo,
+            "lib",
+            "1.0",
+            "<dependencies><dependency><groupId>g</groupId><artifactId>child</artifactId>\
+             <version>1.0</version></dependency></dependencies>",
+        );
+        std::fs::remove_file(repo.join("g/lib/1.0/lib-1.0.jar")).unwrap();
+        let (libs, resolver) = resolve_root(&dir, repo, &lib_dep("[1.0,2.0)"));
+        assert_eq!(libs, ["g:child:1.0"]);
+        let missing: Vec<_> = resolver
+            .missing
+            .iter()
+            .map(|m| format!("{}:{}:{}", m.artifact, m.version, m.kind))
+            .collect();
+        assert_eq!(missing, ["lib:1.0:jar"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 自定义打包类型（如 `hk2-jar`）在本地仓库里仍然是 `.jar`，固定版本不能被误报缺件。
+    #[test]
+    fn custom_jar_type_resolves_jar() {
+        let dir = temp_dir("custom-hk2-jar");
+        let repo = dir.join("repo");
+        install_version(&repo, "custom", "1.0", "");
+        let (libs, resolver) = resolve_root(
+            &dir,
+            repo,
+            "<dependencies><dependency><groupId>g</groupId><artifactId>custom</artifactId>\
+             <version>1.0</version><type>hk2-jar</type></dependency></dependencies>",
+        );
+        assert_eq!(libs, ["g:custom:1.0"]);
+        assert!(resolver.missing.is_empty(), "{:?}", resolver.missing);
+        assert!(resolver.messages.is_empty(), "{:?}", resolver.messages);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同时声明 `java-source` 和普通 jar 时，不论先后顺序，都保留正常的二进制 jar。
+    #[test]
+    fn java_source_type_does_not_shadow_jar() {
+        let dir = temp_dir("java-source-order");
+        let repo = dir.join("repo");
+        install_version(&repo, "lib", "1.0", "");
+        write(&repo.join("g/lib/1.0/lib-1.0-sources.jar"), "");
+        let src_dep = "<dependency><groupId>g</groupId><artifactId>lib</artifactId>\
+                       <version>1.0</version><type>java-source</type></dependency>";
+        let jar_dep = "<dependency><groupId>g</groupId><artifactId>lib</artifactId>\
+                       <version>1.0</version></dependency>";
+        let expected_jar = repo.join("g/lib/1.0/lib-1.0.jar");
+        for deps in [format!("{src_dep}{jar_dep}"), format!("{jar_dep}{src_dep}")] {
+            let root_pom = dir.join("app/pom.xml");
+            write(
+                &root_pom,
+                &format!(
+                    "<project><groupId>g</groupId><artifactId>app</artifactId>\
+                     <version>1</version><dependencies>{deps}</dependencies></project>"
+                ),
+            );
+            let mut r = resolver(repo.clone());
+            let eff = r.effective(&root_pom, 0).unwrap();
+            let jars: Vec<PathBuf> = r
+                .resolve_dependencies(&eff)
+                .into_iter()
+                .filter_map(|dep| match dep {
+                    ResolvedDep::Library { jar, .. } => Some(jar),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(jars, std::slice::from_ref(&expected_jar));
+            assert!(r.missing.is_empty(), "{:?}", r.missing);
+            assert!(r.messages.is_empty(), "{:?}", r.messages);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 区间的并集：每一段都要看，取所有段里的最高版本。
+    #[test]
+    fn version_range_union() {
+        let dir = temp_dir("range-union");
+        let repo = dir.join("repo");
+        install_version(&repo, "lib", "2", "");
+        install_version(&repo, "lib", "2.5", "");
+        let (libs, _) = resolve_root(&dir, repo, &lib_dep("[1,2),(2,3)"));
+        assert_eq!(libs, ["g:lib:2.5"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 区间里一个版本都没有：原样报缺件，交给 Maven 自己按区间下载，不退回下界。
+    #[test]
+    fn unsatisfied_version_range_stays_missing() {
+        let dir = temp_dir("range-missing");
+        let repo = dir.join("repo");
+        install_version(&repo, "lib", "1.0", "");
+        let (libs, resolver) = resolve_root(&dir, repo, &lib_dep("(1.0,2.0)"));
+        assert!(libs.is_empty(), "{libs:?}");
+        let missing: Vec<&str> = resolver
+            .missing
+            .iter()
+            .map(|m| m.version.as_str())
+            .collect();
+        assert_eq!(missing, ["(1.0,2.0)"]);
+        assert!(
+            resolver
+                .messages
+                .iter()
+                .any(|m| m.contains("g:lib:(1.0,2.0)")),
+            "{:?}",
+            resolver.messages
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 导入 BOM 时版本写成区间：导入区间内最高的那个 BOM。
+    #[test]
+    fn bom_import_with_version_range() {
+        let dir = temp_dir("range-bom");
+        let repo = dir.join("repo");
+        for v in ["1.0", "1.1"] {
+            install_version(&repo, "lib", v, "");
+            install_version(
+                &repo,
+                "bom",
+                v,
+                &format!(
+                    "<packaging>pom</packaging><dependencyManagement><dependencies>\
+                     <dependency><groupId>g</groupId><artifactId>lib</artifactId>\
+                     <version>{v}</version></dependency></dependencies></dependencyManagement>"
+                ),
+            );
+            // BOM 只有 pom，没有 jar
+            std::fs::remove_file(repo.join(format!("g/bom/{v}/bom-{v}.jar"))).unwrap();
+        }
+        let (libs, resolver) = resolve_root(
+            &dir,
+            repo,
+            "<dependencyManagement><dependencies><dependency><groupId>g</groupId>\
+             <artifactId>bom</artifactId><version>[1.0,2.0)</version><type>pom</type>\
+             <scope>import</scope></dependency></dependencies></dependencyManagement>\
+             <dependencies><dependency><groupId>g</groupId><artifactId>lib</artifactId>\
+             </dependency></dependencies>",
+        );
+        assert_eq!(libs, ["g:lib:1.1"]);
+        assert!(resolver.messages.is_empty(), "{:?}", resolver.messages);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn version_ranges_and_exclusions() {
-        assert_eq!(normalize_version("[1.2,2.0)"), "1.2");
-        assert_eq!(normalize_version("1.2.3"), "1.2.3");
+        use std::cmp::Ordering::{Equal, Less};
+        assert_eq!(compare_versions("1.9", "1.10"), Less);
+        assert_eq!(compare_versions("1.0", "1.0.0"), Equal);
+        assert_eq!(compare_versions("1.0-rc1", "1.0"), Less);
+        assert_eq!(compare_versions("1.0-SNAPSHOT", "1.0"), Less);
+        assert_eq!(compare_versions("1.0-alpha", "1.0-beta-2"), Less);
+        assert_eq!(compare_versions("1.0-rc", "1.0-snapshot"), Less);
+        assert_eq!(compare_versions("1.0", "1.0-sp1"), Less);
+        assert_eq!(compare_versions("1.0-rc", "1-rc"), Equal);
+        assert_eq!(
+            compare_versions("1.0.1", "1.0-rc"),
+            std::cmp::Ordering::Greater
+        );
+        let bound = |v: &str, inclusive| Some((v.to_owned(), inclusive));
+        assert_eq!(parse_range("1.2.3"), None);
+        assert_eq!(
+            parse_range("[1.2,2.0)"),
+            Some(vec![(bound("1.2", true), bound("2.0", false))])
+        );
+        assert_eq!(
+            parse_range("(,1.0]"),
+            Some(vec![(None, bound("1.0", true))])
+        );
+        assert_eq!(
+            parse_range("[1.0,)"),
+            Some(vec![(bound("1.0", true), None)])
+        );
+        assert_eq!(
+            parse_range("[1.0]"),
+            Some(vec![(bound("1.0", true), bound("1.0", true))])
+        );
+        assert_eq!(
+            parse_range("[1,2), (2,3)"),
+            Some(vec![
+                (bound("1", true), bound("2", false)),
+                (bound("2", false), bound("3", false))
+            ])
+        );
         let ex = vec![Coord {
             group: "g".into(),
             artifact: "*".into(),
