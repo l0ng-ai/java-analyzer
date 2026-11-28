@@ -49,9 +49,10 @@ pub use crate::{
     },
     modules::{module_graph, module_import_candidates, module_imports, ModuleGraph, ModuleInfo},
     resolver::{
-        local_class_owner, lookup_class_in_scope, member_type, resolve_qualified_class,
-        resolve_qualified_class_from, resolve_qualified_class_visible, resolve_simple_type,
-        resolve_type_param, resolve_type_path, resolve_type_ref_to_class, TypeNs, TypeScope,
+        local_class_owner, lookup_class_in_scope, member_type, on_demand_import_candidates,
+        resolve_qualified_class, resolve_qualified_class_from, resolve_qualified_class_visible,
+        resolve_simple_type, resolve_type_param, resolve_type_path, resolve_type_ref_to_class,
+        TypeNs, TypeScope,
     },
     signatures::{
         class_at_decl, class_decls, class_header, constructor_indices, field_named, file_scope,
