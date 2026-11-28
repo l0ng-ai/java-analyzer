@@ -723,8 +723,14 @@ fn unresolved_types(view: &View<'_>, out: &mut Vec<Diagnostic>) {
         if inherited_by_decl {
             continue;
         }
-        // 外围各层类的继承链必须完整，否则名字可能是没解析出来的父类型的成员类型
-        let mut enclosing = scope.class;
+        let on_demand = hir::on_demand_import_candidates(db, file, &name);
+        // 外围各层类的继承链必须完整，否则名字可能是没解析出来的父类型的成员类型。
+        // 类头里的歧义本身可能使继承链不完整，但类自己的成员类型在头部不参与解析。
+        let mut enclosing = if on_demand.len() > 1 && scope.in_class_header {
+            scope.class.and_then(|class| hir::outer_class(db, class))
+        } else {
+            scope.class
+        };
         let mut reliable = true;
         while let Some(class) = enclosing {
             let ok = *resolved_hierarchy
@@ -739,16 +745,19 @@ fn unresolved_types(view: &View<'_>, out: &mut Vec<Diagnostic>) {
         if !reliable {
             continue;
         }
-        // 几个模块导入带进了同名的类
-        let ambiguous = hir::module_import_candidates(db, file, &name);
+        let ambiguous = if on_demand.len() > 1 {
+            on_demand
+        } else {
+            hir::module_import_candidates(db, file, &name)
+        };
         let message = if ambiguous.len() > 1 {
             let names: Vec<String> = ambiguous
                 .iter()
                 .map(|class| class.binary_name(db).replace(['/', '$'], "."))
                 .collect();
             base_db::tr!(
-                "类型 `{name}` 不明确：模块导入同时带进了 {}",
-                "Type `{name}` is ambiguous: module imports bring in {}",
+                "类型 `{name}` 不明确：导入同时带进了 {}",
+                "Type `{name}` is ambiguous: imports bring in {}",
                 names.join(", ")
             )
         } else {
@@ -2478,6 +2487,120 @@ class Main {
             .map(|(_, text)| text.as_str())
             .collect();
         assert_eq!(unresolved, ["Missing", "Nope"], "{diags:?}");
+    }
+
+    #[test]
+    fn ambiguous_on_demand_type_imports() {
+        let errors = errors_in_all_files(
+            r#"
+//- /one/Item.java
+package one;
+public class Item {}
+//- /two/Item.java
+package two;
+public class Item {}
+//- /one/Marker.java
+package one;
+public @interface Marker {}
+//- /two/Marker.java
+package two;
+public @interface Marker {}
+//- /one/String.java
+package one;
+public class String {}
+//- /one/Hidden.java
+package one;
+public class Hidden {}
+//- /two/Hidden.java
+package two;
+class Hidden {}
+//- /one/Outer.java
+package one;
+public class Outer {
+    public static class Member {}
+    public static class HiddenMember {}
+}
+//- /two/Outer.java
+package two;
+public class Outer {
+    public static class Member {}
+    private static class HiddenMember {}
+}
+//- /app/Ambiguous.java
+package app;
+import one.*;
+import two.*;
+class Ambiguous {
+    Item item;
+    @Marker int marked;
+    String text;
+    Hidden ok;
+}
+//- /app/AmbiguousHeader.java
+package app;
+import one.*;
+import two.*;
+class AmbiguousHeader extends Item {}
+//- /app/AmbiguousMember.java
+package app;
+import one.Outer.*;
+import two.Outer.*;
+class AmbiguousMember { Member member; HiddenMember ok; }
+//- /app/DuplicateMember.java
+package app;
+import one.Outer.*;
+import static one.Outer.*;
+class DuplicateMember { Member member; }
+//- /app/Explicit.java
+package app;
+import one.*;
+import two.*;
+import one.Item;
+import java.lang.String;
+class Explicit { Item item; String text; }
+//- /same/Item.java
+package same;
+public class Item {}
+//- /same/SamePackage.java
+package same;
+import one.*;
+import two.*;
+class SamePackage { Item item; }
+//- /app/Nested.java
+package app;
+import one.*;
+import two.*;
+class Nested {
+    class Item {}
+    Item item;
+    <Marker> Marker f(Marker m) { return m; }
+}
+//- /app/Duplicate.java
+package app;
+import one.*;
+import one.*;
+import java.lang.*;
+class Duplicate { Item item; Object value; java.lang.String text; }
+"#,
+        );
+        assert_eq!(
+            errors,
+            [
+                ("Ambiguous", "Item"),
+                ("Ambiguous", "Marker"),
+                ("Ambiguous", "String"),
+                ("AmbiguousHeader", "Item"),
+                ("AmbiguousMember", "Member"),
+            ]
+            .map(|(class, name)| {
+                (
+                    format!("/app/{class}.java"),
+                    DiagnosticCode::UnresolvedType,
+                    name.to_owned(),
+                )
+            }),
+            "{errors:#?}"
+        );
     }
 
     #[test]
