@@ -333,7 +333,7 @@ pub(crate) fn goto_definition(
 pub(crate) fn super_methods(db: &dyn Db, method: MethodId) -> Vec<MethodId> {
     let target = Definition::Method(method);
     let mut res = Vec::new();
-    for sup in all_supers(db, method.class) {
+    for sup in all_supers(db, method.class).iter().copied() {
         let Some(data) = class_data(db, sup) else {
             continue;
         };
