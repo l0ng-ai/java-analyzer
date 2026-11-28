@@ -703,6 +703,9 @@ fn unresolved_types(view: &View<'_>, out: &mut Vec<Diagnostic>) {
             continue;
         }
         let scope = sema.type_scope(file, &node);
+        if name == "__" && is_lombok_onx_placeholder(db, &scope, &node) {
+            continue;
+        }
         // 同一个作用域里同一个名字只解析一次
         let resolved = *resolved_names
             .entry((scope, name.clone()))
@@ -771,6 +774,47 @@ fn unresolved_types(view: &View<'_>, out: &mut Vec<Diagnostic>) {
             unused: false,
         });
     }
+}
+
+/// Lombok 的 javac7 onX 写法：构造器注解的 `onConstructor`，Getter/Setter/With/Wither/WithBy
+/// 的 `onMethod`，以及 Setter/With/Wither/EqualsAndHashCode 的 `onParam`。
+/// Lombok 在 javac 解析注解类型前移除 `@__` 包装，因此 `__` 无需解析。
+fn is_lombok_onx_placeholder(db: &dyn Db, scope: &hir::TypeScope, node: &SyntaxNode) -> bool {
+    let Some(arg) = node.parent().and_then(ast::AnnotationArg::cast) else {
+        return false;
+    };
+    let Some(key) = arg.name_ref() else {
+        return false;
+    };
+    let Some(owner) = arg
+        .syntax()
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(ast::Annotation::cast)
+    else {
+        return false;
+    };
+    let Some(name) = owner.name() else {
+        return false;
+    };
+    let Some(hir::TypeNs::Class(class)) = hir::resolve_type_path(db, scope, &name.segments())
+    else {
+        return false;
+    };
+    matches!(
+        (class.binary_name(db).as_str(), key.text().as_str()),
+        (
+            "lombok/RequiredArgsConstructor"
+                | "lombok/AllArgsConstructor"
+                | "lombok/NoArgsConstructor",
+            "onConstructor"
+        ) | ("lombok/Getter" | "lombok/experimental/WithBy", "onMethod")
+            | (
+                "lombok/Setter" | "lombok/With" | "lombok/experimental/Wither",
+                "onMethod" | "onParam"
+            )
+            | ("lombok/EqualsAndHashCode", "onParam")
+    )
 }
 
 /// 节点在没有登记成类的匿名类（菱形 `new T<>() { ... }`、`outer.new Inner() { ... }`）
@@ -1874,6 +1918,97 @@ class Main {
         assert!(unresolved.is_empty(), "{diags:?}");
     }
 
+    /// 实参是 lambda / 方法引用时，只有与它潜在兼容的重载参与选择（JLS 15.12.2.1）：
+    /// lambda 看形参个数和体的形状（`s -> { return s; }`、`() -> "x"` 只与有返回值的函数类型兼容，
+    /// `s -> {}` 只与 void 的兼容），方法引用看有没有候选方法匹配函数类型的形参个数。
+    /// 先声明的重载都不兼容；选错了返回类型对不上。javac 编译无错误。
+    #[test]
+    fn functional_arg_shape_rules_out_overloads() {
+        let diags = check(
+            r#"
+interface Consumer<T> { void accept(T t); }
+interface Function<T, R> { R apply(T t); }
+interface BiFunction<T, U, R> { R apply(T t, U u); }
+interface Supplier<T> { T get(); }
+interface Runnable { void run(); }
+interface Callable<V> { V call() throws Exception; }
+public class Main {
+    static class Box { Box(String s) {} }
+    static int helper(String s) { return 0; }
+    int inst(String s) { return 0; }
+    static String m(Consumer<String> c) { return "c"; }
+    static int m(Function<String, String> f) { return 1; }
+    static String r(Runnable r) { return "r"; }
+    static int r(Callable<String> c) { return 2; }
+    static String a(BiFunction<String, String, Integer> p) { return "a"; }
+    static int a(Function<String, Integer> p) { return 3; }
+    static String k(Supplier<Object> p) { return "k"; }
+    static int k(Function<String, Object> p) { return 4; }
+    void use() {
+        String a1 = m(s -> {});
+        int b = m(s -> { return s; });
+        int c = r(() -> "x");
+        String d = r(() -> {});
+        int f = r(() -> { return "y"; });
+        int g = a(Main::helper);
+        int h = a(this::inst);
+        int i = k(Box::new);
+    }
+}
+"#,
+        );
+        let wrong: Vec<_> = diags
+            .iter()
+            .filter(|(code, _)| {
+                matches!(
+                    code,
+                    DiagnosticCode::TypeMismatch
+                        | DiagnosticCode::ArgumentMismatch
+                        | DiagnosticCode::AmbiguousCall
+                )
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{diags:?}");
+    }
+
+    /// 多重 catch 的形参按各备选的最小上界参与重载决议（JLS 14.20）：`A | B` 是 `Base`，
+    /// 选 `f(Base)`。javac 编译无错误。
+    #[test]
+    fn multi_catch_parameter_has_the_lub_type() {
+        let diags = check(
+            r#"
+class Base extends Exception {}
+class A extends Base {}
+class B extends Base {}
+public class Main {
+    static String f(A e) { return "a"; }
+    static int f(Base e) { return 1; }
+    static void g() throws A, B {}
+    int use() {
+        try {
+            g();
+        } catch (A | B e) {
+            return f(e);
+        }
+        return 0;
+    }
+}
+"#,
+        );
+        let wrong: Vec<_> = diags
+            .iter()
+            .filter(|(code, _)| {
+                matches!(
+                    code,
+                    DiagnosticCode::TypeMismatch
+                        | DiagnosticCode::ArgumentMismatch
+                        | DiagnosticCode::AmbiguousCall
+                )
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{diags:?}");
+    }
+
     /// 两个同参数个数的泛型构造器竞争、实参里夹着多态表达式（菱形构造）时，
     /// lambda 形参的类型要来自幸存候选解出来的签名，而不是第一个实参的类型。
     /// javac 编译无警告（JLS 18.5.2 / 18.5.4）。
@@ -2638,6 +2773,62 @@ class Main {
         );
     }
 
+    #[test]
+    fn lombok_onx_placeholder_is_not_an_unresolved_type() {
+        let errors = errors_in_all_files(
+            r#"
+//- /lombok/RequiredArgsConstructor.java
+package lombok;
+public @interface RequiredArgsConstructor {}
+//- /lombok/Getter.java
+package lombok;
+public @interface Getter {}
+//- /lombok/Setter.java
+package lombok;
+public @interface Setter {}
+//- /app/Main.java
+package app;
+import lombok.RequiredArgsConstructor;
+import lombok.*;
+
+@RequiredArgsConstructor(onConstructor = @__(@Inject))
+class Main {
+    @interface Inject {}
+
+    @Getter(onMethod = @__({@Deprecated}))
+    @lombok.Setter(onParam = @__(@Inject))
+    String name;
+
+    @RequiredArgsConstructor(onConstructor_ = @Inject)
+    static class Modern {}
+
+    @Getter(onMethod = @__(@Missing))
+    String invalid;
+
+    @Getter(onParam = @__(@Inject))
+    String wrongArgument;
+
+    @interface Other {}
+    @Other(onMethod = @__(@Inject))
+    String wrongAnnotation;
+
+    @__ String ordinary;
+    __ type;
+}
+"#,
+        );
+        let unresolved: Vec<&str> = errors
+            .iter()
+            .filter(|(_, code, _)| *code == DiagnosticCode::UnresolvedType)
+            .map(|(_, _, text)| text.as_str())
+            .collect();
+        assert_eq!(
+            unresolved,
+            ["Missing", "__", "__", "__", "__"],
+            "{errors:?}"
+        );
+    }
+
     /// 每个文件里错误级的诊断（提示和警告不算）。
     fn errors_in_all_files(text: &str) -> Vec<(String, DiagnosticCode, String)> {
         let fx = fixture(text);
@@ -2958,5 +3149,129 @@ public class Main {
             .filter(|(code, _)| *code == DiagnosticCode::TypeMismatch)
             .collect();
         assert!(mismatches.is_empty(), "{diags:?}");
+    }
+
+    /// `Consumer<?>` 交给 `Consumer<? super K1>`（`K1` 是被调用方法还没推断的类型变量）：
+    /// JLS 18.2.3 由 `CAP#1 <: ? super K1` 得到 `K1 <: CAP#1`，取 `K1 = CAP#1` 就适用。javac 编译通过。
+    #[test]
+    fn capture_satisfies_a_super_bound_on_an_inferred_type_variable() {
+        let diags = check(
+            r#"
+interface Consumer<T> { void accept(T t); }
+
+public class G<K> {
+    <K1 extends K> G<K1> f(Consumer<? super K1> c) { return null; }
+    static void t(Consumer<?> c, G<Object> g) { g.f(c); }
+    static void u(Consumer<? extends Number> c, G<Object> g) { g.f(c); }
+}
+
+interface Box<T extends Number> { void put(T t); }
+interface Listener<K, V> { void on(K k, V v); }
+
+class H<K, V> {
+    <K1 extends K, V1 extends V> H<K1, V1> listen(Listener<? super K1, ? super V1> l) { return null; }
+    static void t(H<Object, Object> h, Listener<?, ?> l) { h.listen(l); }
+    static <K1 extends Number> void box(Box<? super K1> b) {}
+    static void u(Box<?> b) { box(b); }
+    static <K1 extends Comparable<K1>> void cmp(Consumer<? super K1> c) {}
+    static void v(Consumer<?> c) { cmp(c); }
+    static <K1 extends String> void str(Consumer<? super K1> c) {}
+    static void w(Consumer<? extends String> c) { str(c); }
+}
+
+class Constrained {
+    static <K1> void second(Consumer<? super K1> c, K1 k) {}
+    static void sc(Consumer<?> c) { second(c, null); }
+    static <K1> void spread(Consumer<? super K1> c, K1... ks) {}
+    static void sp(Consumer<?> c) { spread(c); }
+    static <K1 extends V1, V1> void dep(Consumer<? super K1> c) {}
+    static void dp(Consumer<?> c) { dep(c); }
+    static <T> void copy(java.util.List<? super T> dest, java.util.List<? extends T> src) {}
+    static <T> java.util.List<T> empty() { return null; }
+    static void cp(java.util.List<?> d) { copy(d, empty()); }
+}
+"#,
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    /// 上一条的反面，javac 都拒绝：显式写出了类型实参；捕获变量确定不满足 `K1` 代换后的声明上界。
+    /// `K1` 还出现在别处或上界提到别的类型变量时（`copy(d, s)`、`second(c, "s")`、`twice`、`sib`）
+    /// javac 也拒绝，但同样的形状换个实参就通过（见上一条的 `Constrained`），不报。
+    #[test]
+    fn capture_does_not_satisfy_a_super_bound_on_a_constrained_type_variable() {
+        let diags = check(
+            r#"
+import java.util.List;
+
+interface Consumer<T> { void accept(T t); }
+interface BiConsumer<T, U> { void accept(T t, U u); }
+interface Box<T extends Number> { void put(T t); }
+
+class G<K> {
+    <K1 extends K> G<K1> f(Consumer<? super K1> c) { return null; }
+    <K1> void any(Consumer<? super K1> c) {}
+    static void explicit(Consumer<?> c, G<Object> g) { g.<Object>f(c); }
+    <K2> void explicitParam(Consumer<?> c) { this.<K2>any(c); }
+    static void number(Consumer<?> c, G<Number> g) { g.f(c); }
+    static void integer(Consumer<? extends Number> c, G<Integer> g) { g.f(c); }
+    static <K2> void param(Consumer<?> c, G<K2> g) { g.f(c); }
+    static <K1 extends String> void str(Consumer<? super K1> c) {}
+    static void s(Consumer<?> c) { str(c); }
+    static <K1 extends Integer> void box(Box<? super K1> b) {}
+    static void b(Box<?> b) { box(b); }
+    static <T> void copy(List<? super T> dest, List<? extends T> src) {}
+    static void cp(List<?> d, List<String> s) { copy(d, s); }
+    static <K1> void second(Consumer<? super K1> c, K1 k) {}
+    static void sc(Consumer<?> c) { second(c, "s"); }
+    static <K1> void twice(BiConsumer<? super K1, ? super K1> c) {}
+    static void tw(BiConsumer<?, ?> c) { twice(c); }
+    static <K1 extends V1, V1 extends String> void sib(Consumer<? super K1> c) {}
+    static void sb(Consumer<?> c) { sib(c); }
+}
+"#,
+        );
+        assert_eq!(
+            diags,
+            [
+                (DiagnosticCode::ArgumentMismatch, "f".to_owned()),
+                (DiagnosticCode::ArgumentMismatch, "any".to_owned()),
+                (DiagnosticCode::ArgumentMismatch, "f".to_owned()),
+                (DiagnosticCode::ArgumentMismatch, "f".to_owned()),
+                (DiagnosticCode::ArgumentMismatch, "f".to_owned()),
+                (DiagnosticCode::ArgumentMismatch, "str".to_owned()),
+                (DiagnosticCode::ArgumentMismatch, "box".to_owned()),
+            ],
+        );
+    }
+
+    /// 界是作用域内的类型变量、具体类型或含类型变量的类型时，捕获变量仍确定不满足 `? super`。
+    /// javac 都拒绝。
+    #[test]
+    fn capture_does_not_satisfy_other_super_bounds() {
+        let diags = check(
+            r#"
+import java.util.List;
+
+interface Consumer<T> { void accept(T t); }
+
+class Main {
+    <T> void m(Consumer<?> c) { Consumer<? super T> d = c; }
+    static void s(Consumer<? super String> c) {}
+    static void t(Consumer<?> c) { s(c); }
+    static <K1> void h(Consumer<? super List<K1>> c) {}
+    static void u(Consumer<?> c) { h(c); }
+}
+"#,
+        );
+        assert_eq!(
+            diags,
+            [
+                (DiagnosticCode::UnusedLocal, "d".to_owned()),
+                (DiagnosticCode::TypeMismatch, "c".to_owned()),
+                (DiagnosticCode::ArgumentMismatch, "s".to_owned()),
+                (DiagnosticCode::ArgumentMismatch, "h".to_owned()),
+            ],
+        );
     }
 }

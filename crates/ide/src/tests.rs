@@ -103,6 +103,37 @@ class Square implements Shape { public double area() { return 2; } }
 }
 
 #[test]
+fn goto_implementation_of_inherited_default_method() {
+    let fx = fixture(
+        r#"
+interface Service<T> { default String name() { return "service"; } }
+class UserService implements Service<String> {}
+class Caller { String run(Service<String> svc) { return svc.na$0me(); } }
+"#,
+    );
+    let result = navigation::goto_implementation(&fx.db, position(&fx)).unwrap();
+    assert_eq!(result.info.len(), 1);
+    let nav = &result.info[0];
+    assert_eq!(nav.container.as_deref(), Some("Service"));
+    assert_eq!(slice(&fx, &nav.file, nav.focus_range), "name");
+}
+
+#[test]
+fn goto_implementation_of_overridden_default_method() {
+    let fx = fixture(
+        r#"
+interface Service<T> { default String name() { return "service"; } }
+class UserService implements Service<String> {}
+class OtherService implements Service<String> { public String name() { return "other"; } }
+class Caller { String run(Service<String> svc) { return svc.na$0me(); } }
+"#,
+    );
+    let result = navigation::goto_implementation(&fx.db, position(&fx)).unwrap();
+    assert_eq!(result.info.len(), 1);
+    assert_eq!(result.info[0].container.as_deref(), Some("OtherService"));
+}
+
+#[test]
 fn goto_implementation_of_methods_that_cannot_be_overridden() {
     for (source, expected) in [
         ("class A { final void f$0() {} }\nclass B extends A {}\n", 0),
@@ -189,6 +220,42 @@ class Main {
         .info
         .to_markdown()
         .contains("```java\nstatic int add(int a, int b)\n```"));
+}
+
+#[test]
+fn hover_shows_type_parameter_docs() {
+    let cases = [
+        (
+            r#"
+class Main {
+    /**
+     * @param <E> the {@link List}'s element type
+     * @param e1 the element
+     */
+    static <E> E first(E e1) { return e1; }
+    void f() { fi$0rst("x"); }
+}
+"#,
+            "- `<E>` — the `List`'s element type\n- `e1` — the element",
+        ),
+        (
+            r#"
+/**
+ * @param <T> the value type
+ * @param <U>
+ */
+class Box<T, U> {}
+class Main { Bo$0x<String, Integer> box; }
+"#,
+            "- `<T>` — the value type\n- `<U>`",
+        ),
+    ];
+    for (source, expected) in cases {
+        let fx = fixture(source);
+        let result = hover::hover(&fx.db, position(&fx)).unwrap();
+        let docs = result.info.docs.as_deref().unwrap();
+        assert!(docs.contains(expected), "{docs}");
+    }
 }
 
 #[test]
@@ -542,6 +609,147 @@ class Main { double f(Shape s, Circle c) { return s.area() + c.area(); } }
     );
     assert!(files[0].1.contains("public double size()"));
     assert!(files[1].1.contains("s.size() + c.size()"));
+}
+
+#[test]
+fn rename_record_component_renames_canonical_constructor_params() {
+    let main = "//- /Main.java\nclass Main { int f(Point p) { return p.x(); } }\n";
+    let compact = "record Point(int $0x, int y) {\n    Point { if (x < 0) throw new IllegalArgumentException(); }\n    int sum() { return x + y(); }\n}\n";
+    let explicit = "record Point(int $0x, int y) {\n    Point(int x, int y) { this.x = x; this.y = y; }\n    int sum() { return x + y(); }\n}\n";
+    let main_renamed = "class Main { int f(Point p) { return p.px(); } }\n";
+    // 从组件上改名，和从构造器的形参上改名，结果一样
+    let cases = [
+        (compact.to_owned(), "if (px < 0)"),
+        (
+            compact.replace("$0x", "x").replace("(x <", "($0x <"),
+            "if (px < 0)",
+        ),
+        (explicit.to_owned(), "Point(int px, int y) { this.px = px;"),
+        (
+            explicit
+                .replace("$0x", "x")
+                .replace("(int x, int y) {", "(int $0x, int y) {"),
+            "Point(int px, int y) { this.px = px;",
+        ),
+    ];
+    for (point, ctor) in cases {
+        let src = format!("//- /Point.java\n{point}{main}");
+        let fx = fixture(&src);
+        let change = crate::rename::rename(&fx.db, position(&fx), "px").unwrap();
+        let files = apply_change(&fx, &change);
+        assert_eq!(files.len(), 2, "{src}");
+        assert_eq!(files[0].1, main_renamed, "{src}");
+        let point = &files[1].1;
+        assert!(
+            point.starts_with("record Point(int px, int y) {")
+                && point.contains(ctor)
+                && point.contains("return px + y();")
+                && !point.contains(" x"),
+            "{point}"
+        );
+    }
+}
+
+/// 新名字和规范构造器里已有的局部变量撞名：拒绝（从组件或从构造器形参开始都一样）。
+#[test]
+fn rename_record_component_rejects_conflict_in_canonical_constructor() {
+    let compact = "record Point(int $0x) {\n    Point { int px = 1; if (x < px) throw new IllegalArgumentException(); }\n}\n";
+    let explicit =
+        "record Point(int $0x) {\n    Point(int x) { int px = 1; this.x = x + px; }\n}\n";
+    for src in [
+        compact.to_owned(),
+        compact.replace("$0x", "x").replace("(x <", "($0x <"),
+        explicit.to_owned(),
+        explicit.replace("$0x", "x").replace("(int x)", "(int $0x)"),
+    ] {
+        let fx = fixture(&src);
+        assert!(
+            crate::rename::rename(&fx.db, position(&fx), "px").is_err(),
+            "{src}"
+        );
+    }
+}
+
+/// 构造器里局部类、匿名类的方法形参和新名字同名，但类体里没用到被改名的组件：是合法的遮蔽，
+/// 照常改名（局部类自己的 `px` 不动）；类体里用到了组件（改名后会被捕获）、或者 lambda 形参
+/// 同名（同一个作用域）时拒绝。
+#[test]
+fn rename_record_component_with_nested_class_shadowing() {
+    let local_class = "record Point(int $0x) {\n    Point { class C { int f(int px) { return px; } } if (new C().f(1) < x) throw new IllegalArgumentException(); }\n}\n";
+    let anonymous = "interface Op { int apply(int v); }\nrecord Point(int $0x) {\n    Point { Op op = new Op() { public int apply(int px) { return px; } }; if (op.apply(1) < x) throw new IllegalArgumentException(); }\n}\n";
+    for src in [local_class, anonymous] {
+        let fx = fixture(src);
+        let change = crate::rename::rename(&fx.db, position(&fx), "px").unwrap();
+        let text = &apply_change(&fx, &change)[0].1;
+        assert!(
+            text.contains("record Point(int px)")
+                && text.contains("(int px) { return px; }")
+                && text.contains("< px) throw"),
+            "{text}"
+        );
+    }
+    let capture =
+        "record Point(int $0x) {\n    Point { class C { int f(int px) { return x - px; } } }\n}\n";
+    let lambda = "interface Op { int apply(int v); }\nrecord Point(int $0x) {\n    Point { Op op = px -> px + 1; }\n}\n";
+    // 起点在匿名类里：和 `main` 一样，方法体里有同名的局部符号就拒绝
+    let outer_used = "class Main { static void use(int v) {} void f() { int px = 1; Runnable r = new Runnable() { public void run() { int $0x = 2; use(px + x); } }; } }\n";
+    for src in [capture, lambda, outer_used] {
+        let fx = fixture(src);
+        assert!(
+            crate::rename::rename(&fx.db, position(&fx), "px").is_err(),
+            "{src}"
+        );
+    }
+}
+
+/// 改名不能让局部类、匿名类里的符号换了绑定：内层的局部符号改成外层构造器形参的名字、
+/// 组件改成局部类字段的名字都拒绝；局部类只在别处（lambda 里、更深一层的类里）有同名形参时照常改名。
+#[test]
+fn rename_keeps_bindings_across_nested_classes() {
+    let op = "interface Op { int get(); }\n";
+    let refused = [
+        "record Point(int px) { static int observed; Point { class C { int f() { int $0y = 1; return px + y; } } observed = new C().f(); } }\n",
+        "record Point(int px) { static int observed; Point { class C { int f(int $0y) { return px + y; } } observed = new C().f(1); } }\n",
+        "record Point(int px) { static int observed; Point { Op op = new Op() { public int get() { int $0y = 1; return px + y; } }; observed = op.get(); } }\n",
+        "record Point(int $0x) { static int observed; Point { class C { int px = 5; int f() { return x + px; } } observed = new C().f(); } }\n",
+        "record Point(int $0x) { static int observed; Point { class C { int f(int px) { return px; } int g() { return x; } } C c = new C(); observed = c.f(1) + c.g(); } }\n",
+    ];
+    for src in refused {
+        let fx = fixture(&format!("{op}{src}"));
+        assert!(
+            crate::rename::rename(&fx.db, position(&fx), "px").is_err(),
+            "{src}"
+        );
+    }
+    let allowed = [
+        ("record Point(int $0x) { static int observed; Point { Op op = () -> { class C { int f(int px) { return px; } } return x + new C().f(1); }; observed = op.get(); } }\n", "return px + new C().f(1)"),
+        ("record Point(int $0x) { static int observed; Point { class C { class D { int f(int px) { return px; } } int g() { return x + new D().f(1); } } observed = new C().g(); } }\n", "return px + new D().f(1)"),
+    ];
+    // 内层的局部符号、形参遮蔽的是自己所在类的字段：照常改名
+    let own_field = [
+        ("record Point(int x) { static int observed; Point { class C { int px = 5; int f() { int $0y = 1; return y; } } C c = new C(); observed = c.f() + c.px; } }\n", "int px = 1; return px;"),
+        ("record Point(int x) { static int observed; Point { Fn op = new Fn() { int px = 5; public int apply(int $0y) { return y + 1; } }; observed = op.apply(1); } }\n", "apply(int px) { return px + 1; }"),
+    ];
+    for (src, expected) in own_field {
+        let fx = fixture(&format!("{op}interface Fn {{ int apply(int v); }}\n{src}"));
+        let change = crate::rename::rename(&fx.db, position(&fx), "px")
+            .unwrap_or_else(|err| panic!("{err}\n{src}"));
+        let text = &apply_change(&fx, &change)[0].1;
+        assert!(
+            text.contains(expected) && text.contains("int px = 5;"),
+            "{text}"
+        );
+    }
+    for (src, expected) in allowed {
+        let fx = fixture(&format!("{op}{src}"));
+        let change = crate::rename::rename(&fx.db, position(&fx), "px")
+            .unwrap_or_else(|err| panic!("{err}\n{src}"));
+        let text = &apply_change(&fx, &change)[0].1;
+        assert!(
+            text.contains(expected) && text.contains("int f(int px) { return px; }"),
+            "{text}"
+        );
+    }
 }
 
 #[test]
@@ -1714,7 +1922,7 @@ fn goto_definition_in_annotation_values() {
     }
 }
 
-/// 光标处构造调用跳到的构造器声明的开头。
+/// 光标处调用跳到的方法 / 构造器声明的开头。
 fn constructor_target(text: &str) -> String {
     let fx = fixture(text);
     let result = navigation::goto_definition(&fx.db, position(&fx)).unwrap();
@@ -1722,6 +1930,107 @@ fn constructor_target(text: &str) -> String {
     let nav = &result.info[0];
     let full = slice(&fx, &nav.file, nav.full_range);
     full.split(')').next().unwrap().to_owned() + ")"
+}
+
+/// lambda 体的形状、方法引用的形参个数排除不潜在适用的重载（JLS 15.12.2.1），和声明顺序无关。
+#[test]
+fn functional_arg_shape_picks_the_overload() {
+    let src = r#"
+interface Runnable { void run(); }
+interface Callable<V> { V call() throws Exception; }
+class Main {
+    static String r(Runnable r) { return "r"; }
+    static int r(Callable<String> c) { return 2; }
+    void f() { r$0(() -> "x"); r(() -> {}); }
+}
+"#;
+    assert_eq!(constructor_target(src), "static int r(Callable<String> c)");
+    let void_body = src
+        .replace("r$0(", "r(")
+        .replace("r(() -> {})", "r$0(() -> {})");
+    assert_eq!(
+        constructor_target(&void_body),
+        "static String r(Runnable r)"
+    );
+
+    // 方法引用：`helper` 只有一个形参，只匹配 `Function`
+    let method_ref = r#"
+interface Function<T, R> { R apply(T t); }
+interface BiFunction<T, U, R> { R apply(T t, U u); }
+class Main {
+    static int helper(String s) { return 0; }
+    static String a(BiFunction<String, String, Integer> p) { return ""; }
+    static String a(Function<String, Integer> p) { return ""; }
+    void f() { a$0(Main::helper); }
+}
+"#;
+    assert_eq!(
+        constructor_target(method_ref),
+        "static String a(Function<String, Integer> p)"
+    );
+}
+
+/// 多重 catch 的形参的类型是各备选的最小上界，不是第一个备选。
+#[test]
+fn multi_catch_parameter_picks_the_lub_overload() {
+    let src = r#"
+class Base extends Exception {}
+class A extends Base {}
+class B extends Base {}
+class Main {
+    static String f(A e) { return "a"; }
+    static int f(Base e) { return 1; }
+    static void g() throws A, B {}
+    void use() {
+        try { g(); } catch (A | B e) { f$0(e); }
+    }
+}
+"#;
+    assert_eq!(constructor_target(src), "static int f(Base e)");
+}
+
+/// 最小上界是交集（`Exception & Marker`、`Base & Marker`）时照旧按第一个备选解析重载和成员。
+#[test]
+fn multi_catch_parameter_with_intersection_lub_keeps_first_alternative() {
+    let overload = r#"
+class Main {
+    interface Marker {}
+    static class A extends Exception implements Marker {}
+    static class B extends Exception implements Marker {}
+    static String f(Object e) { return "wrong"; }
+    static int f(Marker e) { return 1; }
+    int use(boolean flag) {
+        try { if (flag) throw new A(); else throw new B(); }
+        catch (A | B e) { return f$0(e); }
+    }
+}
+"#;
+    assert_eq!(constructor_target(overload), "static int f(Marker e)");
+    let members = r#"
+class Main {
+    interface Marker { int code(); }
+    static class Base extends Exception { public int shared() { return 1; } }
+    static class A extends Base implements Marker { public int code() { return 1; } }
+    static class B extends Base implements Marker { public int code() { return 2; } }
+    int use(boolean flag) {
+        try { if (flag) throw new A(); else throw new B(); }
+        catch (A | B e) { return e.shared$0() + e.code(); }
+    }
+}
+"#;
+    assert_eq!(constructor_target(members), "public int shared()");
+    let generic = r#"
+class Main {
+    interface Marker<T> { T code(); }
+    static class A extends Exception implements Marker<String> { public String code() { return "a"; } }
+    static class B extends Exception implements Marker<String> { public String code() { return "b"; } }
+    String use(boolean flag) {
+        try { if (flag) throw new A(); else throw new B(); }
+        catch (A | B e) { return e.code$0(); }
+    }
+}
+"#;
+    assert_eq!(constructor_target(generic), "public String code()");
 }
 
 /// 菱形构造在 `Box(T)` 和更具体的 `Box(CharSequence)` 之间按 JLS 15.12.2.5 选后者，

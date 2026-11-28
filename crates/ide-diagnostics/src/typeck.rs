@@ -19,7 +19,7 @@ use base_db::{Db, SourceFile};
 use hir::{
     all_super_tys, class_data, class_header, is_accessible, is_subtype, method_sig, BodyId,
     ClassId, ClassKind, GenericOwner, InferenceResult, MethodId, Modifiers, PrimitiveType,
-    Resolution, Semantics, Subst, Ty, Visibility,
+    Resolution, Semantics, Subst, Ty, Visibility, Wildcard,
 };
 use syntax::{
     ast::{self, AstNode},
@@ -1010,11 +1010,31 @@ fn is_plain(db: &dyn Db, ty: &Ty) -> bool {
 }
 
 /// 两个类型相同：结构相同，或者不含类型参数时全限定名相同（同名类的两份副本）。
+/// 无界通配符 `?` 与 `? extends Object` 也等价。
 fn same_ty(db: &dyn Db, a: &Ty, b: &Ty) -> bool {
-    a == b
+    if a == b
         || (!a.mentions_params_where(&|_| true)
             && !b.mentions_params_where(&|_| true)
             && a.display_qualified(db) == b.display_qualified(db))
+    {
+        return true;
+    }
+    // 类型参数 T 代换成 Object 后，`? extends T` 与 `?` 等价。
+    match (a, b) {
+        (Ty::Wildcard(Wildcard::Unbounded), Ty::Wildcard(Wildcard::Extends(bound)))
+        | (Ty::Wildcard(Wildcard::Extends(bound)), Ty::Wildcard(Wildcard::Unbounded)) => {
+            same_ty(db, bound, &Ty::object(db))
+        }
+        (Ty::Class(ac, aa), Ty::Class(bc, ba)) => {
+            ac.binary_name(db) == bc.binary_name(db)
+                && aa.len() == ba.len()
+                && aa.iter().zip(ba.iter()).all(|(a, b)| same_ty(db, a, b))
+        }
+        (Ty::Array(a), Ty::Array(b))
+        | (Ty::Wildcard(Wildcard::Extends(a)), Ty::Wildcard(Wildcard::Extends(b)))
+        | (Ty::Wildcard(Wildcard::Super(a)), Ty::Wildcard(Wildcard::Super(b))) => same_ty(db, a, b),
+        _ => false,
+    }
 }
 
 /// 类类型是原始类型（泛型类不带类型实参）。
@@ -1065,6 +1085,7 @@ fn override_checks(
     db: &dyn Db,
     method: MethodId,
     name_range: TextRange,
+    override_range: Option<TextRange>,
     out: &mut Vec<Diagnostic>,
 ) {
     let Some(decl) = hir::method_data(db, method) else {
@@ -1088,6 +1109,7 @@ fn override_checks(
     };
     let own_generic = !decl.type_params.is_empty();
     let raw = raw_inherited_classes(db, method.class);
+    let mut unmatched_annotation = override_range;
 
     for super_ty in all_super_tys(db, &hir::this_ty(db, method.class)) {
         let Ty::Class(owner, args) = &super_ty else {
@@ -1099,6 +1121,7 @@ fn override_checks(
         }
         let erase = raw.contains(&owner);
         let Some(owner_data) = class_data(db, owner) else {
+            unmatched_annotation = None;
             continue;
         };
         let class_subst = Subst::for_class(db, owner, args);
@@ -1160,6 +1183,7 @@ fn override_checks(
                 .map(|p| erase_if(db, p.subst(&subst), erase))
                 .collect();
             if super_params.iter().any(Ty::contains_unknown) {
+                unmatched_annotation = None;
                 continue;
             }
             // 签名相同，或者（非泛型的）覆写方法的签名等于被覆写方法签名的擦除
@@ -1175,7 +1199,35 @@ fn override_checks(
                     !erased.contains_unknown() && same_ty(db, own, &erased)
                 });
             if !exact && !by_erasure {
+                // 菱形构造的匿名类在这里可能丢失推断出的父类型实参。
+                // 尚未代换的类型参数也可能掩盖相同的签名。
+                if unmatched_annotation.is_some()
+                    && !candidate.flags.is_static()
+                    && (sig
+                        .params
+                        .iter()
+                        .chain(&super_params)
+                        .any(|p| p.mentions_params_where(&|_| true))
+                        || (data.flags.contains(Modifiers::ANONYMOUS)
+                            && erase
+                            && super_sig
+                                .params
+                                .iter()
+                                .any(|p| p.mentions_params_where(&|_| true))))
+                {
+                    unmatched_annotation = None;
+                }
                 continue;
+            }
+            if !candidate.flags.is_static()
+                && !decl.flags.is_static()
+                && decl.flags.visibility() != Visibility::Private
+                && (!data.is_interface()
+                    || owner_data.binary_name != "java/lang/Object"
+                    // 接口上标注 @Override 只能重声明 Object 的 public（级别 3）方法。
+                    || super_rank == 3)
+            {
+                unmatched_annotation = None;
             }
             let owner_name = &owner_data.name;
             if candidate.flags.is_static() != decl.flags.is_static() {
@@ -1234,6 +1286,29 @@ fn override_checks(
                 return;
             }
         }
+    }
+    if let Some(range) = unmatched_annotation.filter(|_| {
+        hierarchy_is_resolved(db, method.class)
+            && hir::lookup_class(db, "java/lang/Object").is_some()
+            && !std::iter::once(method.class)
+                .chain(hir::all_supers(db, method.class))
+                .any(|class| lombok_involved(db, class))
+            // JLS 9.6.4.4 也允许显式声明的记录组件访问器标注 @Override。
+            && !(data.kind == ClassKind::Record
+                && decl.params.is_empty()
+                && !decl.flags.is_static()
+                && class_data(db, method.class).is_some_and(|data| {
+                    data.fields.iter().any(|field| !field.flags.is_static() && field.name == decl.name)
+                }))
+    }) {
+        out.push(error(
+            range,
+            DiagnosticCode::InvalidOverride,
+            base_db::tr!(
+                "方法没有覆写或实现父类型中的方法",
+                "Method does not override or implement a method from a supertype"
+            ),
+        ));
     }
 }
 
@@ -2223,7 +2298,27 @@ fn declaration_checks(view: &View<'_>, out: &mut Vec<Diagnostic>) {
                 sema.method_of_decl(file, &node)
             };
             if let (Some(id), Some(name)) = (id, method.name()) {
-                override_checks(db, id, name.syntax().text_range(), out);
+                let override_range = method
+                    .modifier_list()
+                    .into_iter()
+                    .flat_map(|mods| mods.annotations())
+                    .chain(
+                        method
+                            .type_param_list()
+                            .and_then(|_| method.return_type())
+                            .into_iter()
+                            .flat_map(|ty| ty.syntax().descendants().filter_map(ast::Annotation::cast)),
+                    )
+                    .filter_map(|a| a.name())
+                    .find(|ann| {
+                        ann.name_ref().is_some_and(|n| n.text() == "Override")
+                            && matches!(
+                                hir::resolve_type_path(db, &sema.type_scope(file, ann.syntax()), &ann.segments()),
+                                Some(hir::TypeNs::Class(class)) if class.binary_name(db) == "java/lang/Override"
+                            )
+                    })
+                    .map(|ann| ann.syntax().text_range());
+                override_checks(db, id, name.syntax().text_range(), override_range, out);
             }
         }
     }

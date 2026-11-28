@@ -30,7 +30,7 @@ use syntax::{
 use crate::{
     lower::{class_supertypes, field_ty, lower_type_ref, method_sig, this_ty},
     members::MethodCandidate,
-    subtype::{find_super, is_assignable},
+    subtype::{find_super, is_assignable, lub},
     ty::Ty,
 };
 
@@ -1130,9 +1130,22 @@ impl<'a> InferCtx<'a> {
     /// `from` 确定不能赋给 `to`（见 [`crate::subtype::Incompatibility`]）。类型变量只认当前
     /// 作用域里的，类的层次结构要可靠。
     pub(crate) fn certainly_incompatible(&self, from: &Ty, to: &Ty) -> bool {
+        self.certainly_incompatible_inferring(from, to, &|_| None)
+    }
+
+    /// 同 [`Self::certainly_incompatible`]，`inferred` 见
+    /// [`crate::subtype::Incompatibility::with_inferred`]。
+    pub(crate) fn certainly_incompatible_inferring(
+        &self,
+        from: &Ty,
+        to: &Ty,
+        inferred: &dyn Fn(TypeParamId) -> Option<Vec<Ty>>,
+    ) -> bool {
         let reliable = |class: ClassId| self.hierarchy_is_reliable(class);
         let in_scope = |param: TypeParamId| self.type_param_in_scope(param);
-        crate::subtype::Incompatibility::new(self.db, &reliable, &in_scope).not_assignable(from, to)
+        crate::subtype::Incompatibility::new(self.db, &reliable, &in_scope)
+            .with_inferred(inferred)
+            .not_assignable(from, to)
     }
 
     /// 类型变量属于当前方法，或者当前类及其外层类（不是某个函数式接口等别处的类型参数）。
@@ -1657,9 +1670,23 @@ impl<'a> InferCtx<'a> {
                 for catch in it.catch_clauses() {
                     self.push_scope();
                     if let Some(param) = catch.param() {
-                        let ty = param.ty().map_or(Ty::Unknown, |t| self.lower_ty(&t));
+                        let ty = match param.ty() {
+                            // 多重 catch 的形参按各备选的最小上界算（成员、可赋值性都由它决定）；
+                            // 算不出单个类型（交集）时照旧用第一个备选，它的成员和重载多半也对
+                            Some(ast::Type::UnionType(union)) => {
+                                let alternatives: Vec<Ty> =
+                                    union.types().map(|t| self.lower_ty(&t)).collect();
+                                let lub = lub(self.db, &alternatives);
+                                if lub.is_unknown() || matches!(lub, Ty::Intersection(_)) {
+                                    alternatives.into_iter().next().unwrap_or(Ty::Unknown)
+                                } else {
+                                    lub
+                                }
+                            }
+                            Some(t) => self.lower_ty(&t),
+                            None => Ty::Unknown,
+                        };
                         if let Some(name) = param.name() {
-                            // 多重 catch 的形参类型是各备选的最小上界，这里只记了第一个
                             let id = self.declare(&name, ty, LocalKind::CatchParam);
                             self.uncertain_locals.insert(id);
                         }

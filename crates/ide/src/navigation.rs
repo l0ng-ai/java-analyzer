@@ -655,6 +655,12 @@ pub(crate) fn goto_implementation(
                     targets.push(server);
                 }
             }
+            // 默认方法找不到其他实现时，其方法体就是可跳转的实现。
+            if targets.is_empty()
+                && ide_db::definition_flags(db, &def).contains(hir::Modifiers::DEFAULT)
+            {
+                targets.extend(to_nav(db, &def));
+            }
         }
         // Spring 注入点（字段、构造器形参 …）的"实现"是注入进来的 Bean 定义
         _ => match crate::beans::injected_beans(db, &def) {

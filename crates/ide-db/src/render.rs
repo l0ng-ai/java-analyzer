@@ -155,7 +155,8 @@ pub fn method_signature(db: &dyn Db, method: MethodId, subst: &Subst) -> String 
         out.push(' ');
     }
     if !m.is_constructor {
-        out.push_str(&sig.ret.subst(subst).display(db));
+        // 捕获的通配符用作返回值时显示其上界，保留类型实参里的通配符。
+        out.push_str(&sig.ret.subst(subst).upper_bound(db).display(db));
         out.push(' ');
     }
     out.push_str(&m.name);
