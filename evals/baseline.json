@@ -31,8 +31,8 @@
       "expected_failures": 0
     },
     "frameworks": {
-      "passed": 8,
-      "total": 8,
+      "passed": 11,
+      "total": 11,
       "expected_failures": 0
     },
     "hints": {
@@ -81,8 +81,8 @@
       "expected_failures": 0
     },
     "project": {
-      "passed": 10,
-      "total": 10,
+      "passed": 11,
+      "total": 11,
       "expected_failures": 0
     },
     "references": {
