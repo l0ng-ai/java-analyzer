@@ -546,8 +546,7 @@ fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
 
 /// 导入 `root` 处的工程。优先级：手动配置里的模块 → Maven → Gradle → 目录约定。
 pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
-    maven_settings::set_project_setup(configured_maven_setup(root).unwrap_or_default());
-    load_root(root, options)
+    load_projects(&[root.to_path_buf()], options)
 }
 
 fn load_root(root: &Path, options: &LoadOptions) -> LoadedProject {
@@ -660,6 +659,34 @@ fn load_root(root: &Path, options: &LoadOptions) -> LoadedProject {
     }
 }
 
+/// 只在没有构建文件或显式配置的目录里查找子工程；找到一个根就交给它自己的导入器处理。
+fn discover_build_roots(dir: &Path, depth: usize, roots: &mut Vec<PathBuf>) {
+    if dir.join(CONFIG_FILE_NAME).is_file()
+        || dir.join("pom.xml").is_file()
+        || gradle::is_gradle_root(dir)
+    {
+        roots.push(dir.to_path_buf());
+        return;
+    }
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || matches!(name.as_ref(), "target" | "build" | "node_modules") {
+            continue;
+        }
+        // 不跟随符号链接，避免扫描工作区之外的目录。
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            discover_build_roots(&entry.path(), depth - 1, roots);
+        }
+    }
+}
+
 /// 导入多个工作区根并合并成一张工程图。
 ///
 /// 每个根各自按 [`load_project`] 的规则导入；合并时模块编号顺延，同一个 jar 只保留一份。
@@ -668,6 +695,22 @@ fn load_root(root: &Path, options: &LoadOptions) -> LoadedProject {
 /// 改成直接依赖那个模块的源码。模块的坐标：Maven 取 pom 里的 groupId:artifactId，
 /// Gradle 取工程的 group 和 name。
 pub fn load_projects(roots: &[PathBuf], options: &LoadOptions) -> LoadedProject {
+    let mut expanded = Vec::new();
+    for root in roots {
+        let mut discovered = Vec::new();
+        // shortcut: 只找四层目录以内的工程，更深的工程需要显式打开。
+        discover_build_roots(root, 4, &mut discovered);
+        if discovered.is_empty() {
+            discovered.push(root.clone());
+        }
+        discovered.sort();
+        for project in discovered {
+            if !expanded.contains(&project) {
+                expanded.push(project);
+            }
+        }
+    }
+    let roots = &expanded;
     // Maven 的设置和 JDK 一样整个工作区共用：取第一个在 `java-analyzer.toml` 里写了 `[maven]` 的根
     maven_settings::set_project_setup(
         roots
@@ -1340,6 +1383,74 @@ mod tests {
     }
 
     #[test]
+    fn discovers_nested_build_roots_without_reimporting_reactor_modules() {
+        let dir = std::env::temp_dir().join(format!("ja-nested-roots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let write = |path: &str, text: &str| {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let pom = |artifact: &str, body: &str| {
+            format!("<project><groupId>ja.test.nested</groupId><artifactId>{artifact}</artifactId><version>1</version>{body}</project>")
+        };
+        write("a/pom.xml", &pom("app", "<dependencies><dependency><groupId>ja.test.nested</groupId><artifactId>lib</artifactId><version>1</version></dependency></dependencies>"));
+        write(
+            "b/pom.xml",
+            &pom(
+                "parent",
+                "<packaging>pom</packaging><modules><module>lib</module></modules>",
+            ),
+        );
+        write("b/lib/pom.xml", &pom("lib", ""));
+        write("b/example/pom.xml", &pom("not-a-reactor-module", ""));
+        write("worktrees/a/pom.xml", &pom("app", ""));
+        for skipped in [
+            "target",
+            "build",
+            "node_modules",
+            ".git",
+            ".hidden",
+            "one/two/three/four/five",
+        ] {
+            write(&format!("{skipped}/pom.xml"), &pom("ignored", ""));
+        }
+        let options = LoadOptions {
+            maven_use_cli: false,
+            gradle_allow_run: false,
+            ..LoadOptions::default()
+        };
+        let loaded = load_projects(std::slice::from_ref(&dir), &options);
+        assert_eq!(loaded.kind, ProjectKind::Maven);
+        let roots: Vec<_> = loaded
+            .graph
+            .modules
+            .iter()
+            .map(|m| m.root.clone())
+            .collect();
+        assert_eq!(
+            roots,
+            [
+                dir.join("a"),
+                dir.join("b"),
+                dir.join("b/lib"),
+                dir.join("worktrees/a")
+            ]
+        );
+        assert_eq!(module_deps(&loaded.graph, "app"), ["lib"]);
+        assert!(loaded.build_files.contains(&dir.join("b/lib/pom.xml")));
+
+        write(CONFIG_FILE_NAME, "[maven]\n");
+        assert_eq!(load_project(&dir, &options).kind, ProjectKind::Plain);
+        write(CONFIG_FILE_NAME, "[[module]]\nname = 'manual'\n");
+        let manual = load_projects(std::slice::from_ref(&dir), &options);
+        assert_eq!(manual.kind, ProjectKind::Manual);
+        assert_eq!(manual.graph.modules.len(), 1);
+        assert_eq!(manual.graph.modules[0].name, "manual");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn poms_starting_with_a_byte_order_mark_import_as_maven() {
         // Windows 上的编辑器保存的 pom.xml 常以 UTF-8 BOM 开头（l0ng-ai/openidea#4928）
         let dir = std::env::temp_dir().join(format!("ja-pom-bom-{}", std::process::id()));
@@ -1435,6 +1546,13 @@ mod tests {
             gradle_allow_run: false,
         };
         let loaded = load_projects(&[dir.join("orders"), dir.join("users")], &options);
+        let discovered = load_project(&dir, &options);
+        assert_eq!(discovered.kind, ProjectKind::Gradle);
+        assert_eq!(
+            module_deps(&discovered.graph, "orders"),
+            module_deps(&loaded.graph, "orders")
+        );
+        assert_eq!(discovered.graph.modules.len(), loaded.graph.modules.len());
         for cache in caches {
             let _ = std::fs::remove_file(cache);
         }

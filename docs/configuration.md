@@ -120,7 +120,9 @@ Maven 的 `<activation><jdk>` 按 `JAVA_HOME`（没有设置时按找到的最�
     这些模块的源码；被包含构建的构建文件变化同样会触发重新导入。
   - `buildSrc`：作为一个单独的模块导入（带着 Gradle API 等依赖），其中的 Java 代码照常分析；
     它只给构建脚本用，其他模块看不到它的类。
-- **都没有**：按目录约定找源码根（`src/main/java`、`src/test/java`、`src`）。
+- **都没有**：没有 `java-analyzer.toml` 时，在四层目录以内查找 Maven / Gradle 工程或手动配置，
+  跳过隐藏目录、`target`、`build`、`node_modules` 和符号链接。找到工程根就不继续向下搜索，
+  按多根工作区合并；没有找到时仍按目录约定找源码根（`src/main/java`、`src/test/java`、`src`）。
 - `pom.xml`、`*.gradle(.kts)`、`gradle.properties`、`libs.versions.toml`、`java-analyzer.toml`
   变化后自动重新导入。
 - `target/generated-sources/*`、`build/generated/sources/*` 下的代码作为源码参与分析。
