@@ -2296,23 +2296,69 @@ impl InferCtx<'_> {
         {
             return true;
         }
+        let owner = GenericOwner::Method(candidate.id);
+        let formals: Vec<Ty> = sig
+            .params
+            .iter()
+            .map(|p| p.subst(&candidate.subst))
+            .collect();
+        let explicit = arg_exprs
+            .first()
+            .and_then(|arg| arg.syntax().parent()?.parent())
+            .and_then(ast::MethodCall::cast)
+            .is_some_and(|call| call.type_arg_list().is_some());
+        // 方法的类型变量没有显式写出、在所有形参里只出现一次时只由那个实参推断，给出它代换后
+        // 不提到方法自己类型变量的声明上界（见 `Incompatibility::with_inferred`）。出现在别处时
+        // 由所有约束一起决定（`copy(List<? super T>, List<? extends T>)` 收 `List<String>` 时
+        // javac 拒绝，收 `emptyList()` 时接受），给空表不下结论
+        let inferred = |param: hir_def::TypeParamId| -> Option<Vec<Ty>> {
+            if explicit || param.owner != owner {
+                return None;
+            }
+            let count = std::cell::Cell::new(0);
+            for formal in &formals {
+                formal.mentions_params_where(&|p| {
+                    count.set(count.get() + usize::from(p == param));
+                    false
+                });
+            }
+            let bounds: Vec<Ty> = crate::lower::type_param_bounds(db, param)
+                .iter()
+                .map(|b| b.subst(&candidate.subst))
+                .collect();
+            // 上界提到别的方法类型变量（`<K1 extends V1, V1>`）时 `K1` 也受 `V1` 的约束，同上；
+            // 只提到自己（`K1 extends Comparable<K1>`）的上界不拿来判断
+            if count.get() != 1
+                || bounds
+                    .iter()
+                    .any(|b| b.mentions_params_where(&|p| p.owner == owner && p != param))
+            {
+                return Some(Vec::new());
+            }
+            Some(
+                bounds
+                    .into_iter()
+                    .filter(|b| !b.mentions_params_where(&|p| p == param))
+                    .collect(),
+            )
+        };
         (0..fixed).any(|idx| {
             let Arg::Ty(arg) = &args[idx] else {
                 return false;
             };
             let generic = !self.suppress_unresolved
-                && !self.inference_overlaps_scope(&[GenericOwner::Method(candidate.id)])
+                && !self.inference_overlaps_scope(&[owner])
                 && self.candidate_subst_certain(call_receiver, candidate.id)
                 && self.type_is_certain(&arg_exprs[idx])
-                && self.certainly_incompatible(arg, &sig.params[idx].subst(&candidate.subst));
+                && self.certainly_incompatible_inferring(arg, &formals[idx], &inferred);
             if generic {
                 return true;
             }
             let Some(arg) = self.erased_arg(arg, &arg_exprs[idx]) else {
                 return false;
             };
-            let param = sig.params[idx].subst(&candidate.subst);
-            let param = match &param {
+            let param = &formals[idx];
+            let param = match param {
                 Ty::Primitive(_) => param.clone(),
                 Ty::Class(class, _) if self.hierarchy_is_reliable(*class) => Ty::class(*class),
                 _ => return false,

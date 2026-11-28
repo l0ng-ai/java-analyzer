@@ -306,6 +306,11 @@ pub struct Incompatibility<'a> {
     db: &'a dyn Db,
     reliable: &'a dyn Fn(ClassId) -> bool,
     in_scope: &'a dyn Fn(hir_def::TypeParamId) -> bool,
+    inferred: &'a dyn Fn(hir_def::TypeParamId) -> Option<Vec<Ty>>,
+}
+
+fn not_inferred(_: hir_def::TypeParamId) -> Option<Vec<Ty>> {
+    None
 }
 
 impl<'a> Incompatibility<'a> {
@@ -318,7 +323,18 @@ impl<'a> Incompatibility<'a> {
             db,
             reliable,
             in_scope,
+            inferred: &not_inferred,
         }
+    }
+
+    /// 被调用方法的类型变量由这一个实参推断：`inferred` 对这样的变量给出代换后的声明上界，
+    /// 拿不准的给空表（不下结论），已经固定的变量给 `None`。只影响捕获变量对 `? super K1` 的判断。
+    pub fn with_inferred(
+        mut self,
+        inferred: &'a dyn Fn(hir_def::TypeParamId) -> Option<Vec<Ty>>,
+    ) -> Self {
+        self.inferred = inferred;
+        self
     }
 
     /// 类型可以拿来下结论（见类型本身的说明）。
@@ -478,32 +494,31 @@ impl<'a> Incompatibility<'a> {
         }
         match sup_arg {
             Ty::Wildcard(Wildcard::Unbounded) => false,
-            // 捕获变量的上界：通配符的界和类型参数声明的上界（的交）。交叉类型是 `S` 的子类型
-            // 只要有一个成员是，所以每个上界都确定不是 `S` 的子类型才算
+            // 交叉类型是 `S` 的子类型只要有一个成员是，所以每个上界都确定不是 `S` 的子类型才算
             Ty::Wildcard(Wildcard::Extends(bound)) => {
-                let mut uppers: Vec<Ty> = Vec::new();
-                if let Ty::Wildcard(Wildcard::Extends(w)) = wildcard {
-                    uppers.push((**w).clone());
-                }
-                for declared in type_param_bounds(self.db, param).iter() {
-                    // 上界提到了类型参数（`T extends Comparable<T>`）：代换出来的是捕获变量，不深究
-                    if crate::method_resolution::mentions_type_param(declared)
-                        || !self.is_plain(declared)
-                    {
-                        return false;
-                    }
-                    uppers.push(declared.clone());
-                }
-                if uppers.is_empty() {
-                    uppers.push(Ty::object(self.db));
-                }
-                uppers
-                    .iter()
-                    .all(|upper| self.not_subtype(upper, bound, depth + 1))
+                self.capture_uppers(param, wildcard).is_some_and(|uppers| {
+                    uppers
+                        .iter()
+                        .all(|upper| self.not_subtype(upper, bound, depth + 1))
+                })
             }
             // 只有 `? super L` 捕获出来的变量有下界
-            Ty::Wildcard(Wildcard::Super(bound)) => match wildcard {
-                Ty::Wildcard(Wildcard::Super(lower)) => self.not_subtype(bound, lower, depth + 1),
+            Ty::Wildcard(Wildcard::Super(bound)) => match (wildcard, &**bound) {
+                (Ty::Wildcard(Wildcard::Super(lower)), _) => {
+                    self.not_subtype(bound, lower, depth + 1)
+                }
+                // 界是只由这个实参推断的方法类型变量 `K1`：JLS 18.2.3 得到 `K1 <: CAP`，取
+                // `K1 = CAP` 就适用，除非捕获变量确定不满足 `K1` 的声明上界（javac 拒绝
+                // `<K1 extends String>` 收 `Consumer<?>`）
+                (_, Ty::TypeParam(k1)) => match (self.inferred)(*k1) {
+                    Some(declared) => self.capture_uppers(param, wildcard).is_some_and(|uppers| {
+                        declared.iter().any(|d| {
+                            self.is_plain(d)
+                                && uppers.iter().all(|u| self.not_subtype(u, d, depth + 1))
+                        })
+                    }),
+                    None => true,
+                },
                 _ => true,
             },
             // 捕获变量是一个新的类型，不等于任何具体类型。但 javac 把 `? super T` 捕获出来、
@@ -520,6 +535,25 @@ impl<'a> Incompatibility<'a> {
                 _ => true,
             },
         }
+    }
+
+    /// 捕获变量的上界：通配符的界和类型参数声明的上界（的交）。上界提到了类型参数
+    /// （`T extends Comparable<T>`）时代换出来的是捕获变量，不深究，给 `None`。
+    fn capture_uppers(&self, param: hir_def::TypeParamId, wildcard: &Ty) -> Option<Vec<Ty>> {
+        let mut uppers: Vec<Ty> = Vec::new();
+        if let Ty::Wildcard(Wildcard::Extends(w)) = wildcard {
+            uppers.push((**w).clone());
+        }
+        for declared in type_param_bounds(self.db, param).iter() {
+            if crate::method_resolution::mentions_type_param(declared) || !self.is_plain(declared) {
+                return None;
+            }
+            uppers.push(declared.clone());
+        }
+        if uppers.is_empty() {
+            uppers.push(Ty::object(self.db));
+        }
+        Some(uppers)
     }
 
     /// 两个具体的类型实参确定不是同一个类型。通配符之间的比较拿不准（`?` 和 `? extends Object`
