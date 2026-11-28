@@ -1696,8 +1696,13 @@ impl InferCtx<'_> {
                     implicit: lambda.param_list().is_some_and(|p| {
                         p.params().next().is_some() && p.params().all(|param| param.ty().is_none())
                     }),
+                    // 判断不了（体里有 throw、循环）时两种都算兼容
+                    void_compatible: lambda_shape_fits(lambda, false) != Some(false),
+                    value_compatible: lambda_shape_fits(lambda, true) != Some(false),
                 },
-                ast::Expr::MethodRef(_) => Arg::MethodRef,
+                ast::Expr::MethodRef(method_ref) => Arg::MethodRef {
+                    arities: self.method_ref_arities(method_ref),
+                },
                 other => Arg::Ty(self.infer_expr(other, None)),
             })
             .collect();
@@ -1765,7 +1770,7 @@ impl InferCtx<'_> {
                     .map(|arg| match arg {
                         Arg::Ty(ty) => ty.display(db),
                         Arg::Lambda { .. } => "lambda".to_owned(),
-                        Arg::MethodRef => base_db::tr!("方法引用", "method reference"),
+                        Arg::MethodRef { .. } => base_db::tr!("方法引用", "method reference"),
                     })
                     .collect();
                 self.diagnostic(
@@ -2296,23 +2301,69 @@ impl InferCtx<'_> {
         {
             return true;
         }
+        let owner = GenericOwner::Method(candidate.id);
+        let formals: Vec<Ty> = sig
+            .params
+            .iter()
+            .map(|p| p.subst(&candidate.subst))
+            .collect();
+        let explicit = arg_exprs
+            .first()
+            .and_then(|arg| arg.syntax().parent()?.parent())
+            .and_then(ast::MethodCall::cast)
+            .is_some_and(|call| call.type_arg_list().is_some());
+        // 方法的类型变量没有显式写出、在所有形参里只出现一次时只由那个实参推断，给出它代换后
+        // 不提到方法自己类型变量的声明上界（见 `Incompatibility::with_inferred`）。出现在别处时
+        // 由所有约束一起决定（`copy(List<? super T>, List<? extends T>)` 收 `List<String>` 时
+        // javac 拒绝，收 `emptyList()` 时接受），给空表不下结论
+        let inferred = |param: hir_def::TypeParamId| -> Option<Vec<Ty>> {
+            if explicit || param.owner != owner {
+                return None;
+            }
+            let count = std::cell::Cell::new(0);
+            for formal in &formals {
+                formal.mentions_params_where(&|p| {
+                    count.set(count.get() + usize::from(p == param));
+                    false
+                });
+            }
+            let bounds: Vec<Ty> = crate::lower::type_param_bounds(db, param)
+                .iter()
+                .map(|b| b.subst(&candidate.subst))
+                .collect();
+            // 上界提到别的方法类型变量（`<K1 extends V1, V1>`）时 `K1` 也受 `V1` 的约束，同上；
+            // 只提到自己（`K1 extends Comparable<K1>`）的上界不拿来判断
+            if count.get() != 1
+                || bounds
+                    .iter()
+                    .any(|b| b.mentions_params_where(&|p| p.owner == owner && p != param))
+            {
+                return Some(Vec::new());
+            }
+            Some(
+                bounds
+                    .into_iter()
+                    .filter(|b| !b.mentions_params_where(&|p| p == param))
+                    .collect(),
+            )
+        };
         (0..fixed).any(|idx| {
             let Arg::Ty(arg) = &args[idx] else {
                 return false;
             };
             let generic = !self.suppress_unresolved
-                && !self.inference_overlaps_scope(&[GenericOwner::Method(candidate.id)])
+                && !self.inference_overlaps_scope(&[owner])
                 && self.candidate_subst_certain(call_receiver, candidate.id)
                 && self.type_is_certain(&arg_exprs[idx])
-                && self.certainly_incompatible(arg, &sig.params[idx].subst(&candidate.subst));
+                && self.certainly_incompatible_inferring(arg, &formals[idx], &inferred);
             if generic {
                 return true;
             }
             let Some(arg) = self.erased_arg(arg, &arg_exprs[idx]) else {
                 return false;
             };
-            let param = sig.params[idx].subst(&candidate.subst);
-            let param = match &param {
+            let param = &formals[idx];
+            let param = match param {
                 Ty::Primitive(_) => param.clone(),
                 Ty::Class(class, _) if self.hierarchy_is_reliable(*class) => Ty::class(*class),
                 _ => return false,
@@ -2419,7 +2470,9 @@ impl InferCtx<'_> {
         let args: Vec<Arg> = arg_exprs
             .iter()
             .map(|arg| match arg {
-                ast::Expr::LambdaExpr(_) | ast::Expr::MethodRef(_) => Arg::MethodRef,
+                ast::Expr::LambdaExpr(_) | ast::Expr::MethodRef(_) => {
+                    Arg::MethodRef { arities: None }
+                }
                 other => Arg::Ty(
                     self.result
                         .type_of(other.syntax().text_range())
@@ -3115,6 +3168,65 @@ impl InferCtx<'_> {
             };
         }
         result
+    }
+
+    /// 方法引用能匹配哪些函数类型形参个数（JLS 15.12.2.1）：`Type::m` 的静态方法取 m 的
+    /// 形参个数，实例方法再加上接收者；`expr::m` 只看实例方法；`Type::new` 看构造器。
+    /// 接收者、候选可能不全时返回 `None`。
+    fn method_ref_arities(&mut self, method_ref: &ast::MethodRef) -> Option<Vec<(usize, bool)>> {
+        let db = self.db;
+        let (receiver, is_type) = if let Some(t) = method_ref.receiver_type() {
+            (self.lower_ty(&t), true)
+        } else {
+            let e = method_ref.receiver_expr()?;
+            // 选定方法之后接收者还会再推断一遍：这里只推断简单的名字，诊断也不留
+            if !matches!(
+                e,
+                ast::Expr::NameExpr(_) | ast::Expr::FieldAccess(_) | ast::Expr::ThisExpr(_)
+            ) {
+                return None;
+            }
+            let n_diagnostics = self.result.diagnostics.len();
+            let value = self.infer_value(&e, None);
+            self.result.diagnostics.truncate(n_diagnostics);
+            match value {
+                Value::Ty(ty) => (ty, false),
+                Value::Type(class) => (Ty::class(class), true),
+                Value::Package(_) => return None,
+            }
+        };
+        let Ty::Class(class, _) = &receiver else {
+            return None;
+        };
+        if receiver.contains_unknown() || !self.hierarchy_is_reliable(*class) {
+            return None;
+        }
+        let constructor = method_ref.is_constructor();
+        let candidates = if constructor {
+            if !is_type {
+                return None;
+            }
+            constructors(db, *class, &Subst::empty())
+        } else {
+            lookup_methods(db, &receiver, &method_ref.name_ref()?.text())
+        };
+        let mut arities = Vec::new();
+        for candidate in &candidates {
+            let sig = method_sig(db, candidate.id);
+            let is_static = !constructor && method_flags(self, candidate.id).is_static();
+            let n = match (is_type && !constructor, is_static) {
+                (true, true) | (false, false) => sig.params.len(),
+                (true, false) => sig.params.len() + 1,
+                // `expr::m` 不能引用静态方法
+                (false, true) => continue,
+            };
+            arities.push(if sig.varargs {
+                (n - 1, true)
+            } else {
+                (n, false)
+            });
+        }
+        (!arities.is_empty()).then_some(arities)
     }
 
     /// 解析方法引用，返回被引用方法的返回类型（构造器引用返回被构造的类型）。

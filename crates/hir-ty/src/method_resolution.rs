@@ -23,14 +23,21 @@ use crate::{
 #[derive(Clone, Debug)]
 pub enum Arg {
     Ty(Ty),
-    /// lambda：只知道形参个数，类型要等选定方法之后才能推
+    /// lambda：只知道形参个数和体的形状，类型要等选定方法之后才能推
     Lambda {
         arity: usize,
         /// 形参都没写类型（`x -> ...`）。零个形参的 lambda 按显式类型算
         implicit: bool,
+        /// 体可能与 void 的函数类型兼容（语句表达式，或没有 `return 值;` 的块）
+        void_compatible: bool,
+        /// 体可能与有返回值的函数类型兼容（表达式，或只有 `return 值;` 的块）
+        value_compatible: bool,
     },
-    /// 方法引用
-    MethodRef,
+    /// 方法引用。`arities`：它能匹配的函数类型形参个数 `(n, 可变参数)`，可变参数时不少于 `n`
+    /// 的都行；不知道时是 `None`
+    MethodRef {
+        arities: Option<Vec<(usize, bool)>>,
+    },
 }
 
 /// 合一的上下文：哪些类型参数是待推断的，以及目前推出的绑定。
@@ -674,16 +681,35 @@ fn args_applicable(db: &dyn Db, call: &Call, args: &[Arg], allow_boxing: bool) -
                     || (!call.inference.approximate.is_empty()
                         && fits(&call.param_ty_capturing(idx)))
             }
-            Arg::Lambda { arity, .. } => match &param {
-                Ty::Class(..) => match functional_method(db, &param) {
-                    Some(method) => method_sig(db, method.id).params.len() == *arity,
-                    None => false,
-                },
+            // 潜在兼容（JLS 15.12.2.1）：形参个数相同，体的形状与函数类型的返回值相符
+            Arg::Lambda {
+                arity,
+                void_compatible,
+                value_compatible,
+                ..
+            } => match &param {
+                Ty::Class(..) => functional_method(db, &param).is_some_and(|method| {
+                    let sig = method_sig(db, method.id);
+                    sig.params.len() == *arity
+                        && if sig.ret == Ty::Void {
+                            *void_compatible
+                        } else {
+                            *value_compatible
+                        }
+                }),
                 Ty::TypeParam(_) | Ty::Unknown => true,
                 _ => false,
             },
-            Arg::MethodRef => match &param {
-                Ty::Class(..) => functional_method(db, &param).is_some(),
+            // 潜在兼容（JLS 15.12.2.1）：有候选方法能匹配函数类型的形参个数
+            Arg::MethodRef { arities } => match &param {
+                Ty::Class(..) => functional_method(db, &param).is_some_and(|method| {
+                    let n = method_sig(db, method.id).params.len();
+                    arities.as_ref().is_none_or(|arities| {
+                        arities
+                            .iter()
+                            .any(|&(min, varargs)| n == min || (varargs && n > min))
+                    })
+                }),
                 Ty::TypeParam(_) | Ty::Unknown => true,
                 _ => false,
             },
@@ -723,7 +749,7 @@ fn certain_ambiguity(
     let args_clear = args.iter().all(|arg| match arg {
         Arg::Ty(ty) => !ty.contains_unknown() && !mentions_type_param(ty),
         Arg::Lambda { implicit, .. } => *implicit,
-        Arg::MethodRef => false,
+        Arg::MethodRef { .. } => false,
     });
     let candidates_clear = in_phase.iter().all(|s| {
         !is_generic(s)

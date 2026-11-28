@@ -829,7 +829,6 @@ fn add_setters(builder: &mut ClassData, params: Vec<BuilderParam>, prefix: &str,
             continue;
         };
         // `@Singular`：逐个添加、整批添加、清空
-        let single = single.filter(|s| s != p.name.as_str());
         if MAP_TYPES.contains(&type_name) {
             let (key, value) = (element(args, 0), element(args, 1));
             if let Some(single) = &single {
@@ -1898,6 +1897,24 @@ mod tests {
                 "withItems/1",
                 "withName/1",
                 "withSize/1",
+            ]
+        );
+    }
+
+    #[test]
+    fn singular_name_same_as_plural_keeps_both_adders() {
+        // Lombok 照样生成逐个添加的方法，它和整批添加的方法只是同名重载
+        let text = "@lombok.Builder class C { @lombok.Singular(\"metadata\") java.util.Map<String, String> metadata; @lombok.Singular(\"items\") java.util.List<String> items; }";
+        assert_eq!(
+            methods_of(text, "CBuilder"),
+            [
+                "build/0",
+                "clearItems/0",
+                "clearMetadata/0",
+                "items/1",
+                "items/1",
+                "metadata/1",
+                "metadata/2",
             ]
         );
     }
