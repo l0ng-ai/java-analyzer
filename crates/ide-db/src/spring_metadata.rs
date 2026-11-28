@@ -329,6 +329,15 @@ pub fn shape_of_type_name(ty: &str) -> (Shape, Option<String>) {
     (Shape::Scalar, Some(binary_name_of(erasure)))
 }
 
+/// 分组的类型是 JDK 里的 Map。只认得出这些：自己的类名以 `Map` 结尾（`RoadMap`）不算，
+/// 认不出的分组照常检查键。
+fn is_jdk_map(ty: &str) -> bool {
+    let erasure = erasure_of(ty);
+    erasure.starts_with("java.util.")
+        && (erasure.ends_with("Map")
+            || matches!(erasure, "java.util.Properties" | "java.util.Hashtable"))
+}
+
 fn erasure_of(ty: &str) -> &str {
     let ty = ty.trim();
     ty.find('<').map_or(ty, |i| &ty[..i])
@@ -611,7 +620,7 @@ fn collect_class(
     stack.push(class);
     // 自己和父类（不含接口和 `Object`）
     let mut chain = vec![class];
-    chain.extend(hir::all_supers(db, class).into_iter().filter(|c| {
+    chain.extend(hir::all_supers(db, class).iter().copied().filter(|c| {
         hir::class_data(db, *c).is_some_and(|d| {
             !d.is_interface()
                 && d.binary_name != "java/lang/Object"
@@ -705,6 +714,9 @@ pub enum KeyMatch<'a> {
     /// 落在 `Map` / 集合类型（或类型未知）的配置项下面
     Within(&'a PropertyMeta),
     Group(&'a GroupMeta),
+    /// 落在类型是 `Map` 的分组下面（`@Bean @ConfigurationProperties(prefix = "sms.blends") Map<..>`）：
+    /// Spring Boot 把下面任意的键都绑定进去
+    WithinGroup(&'a GroupMeta),
     /// 没有这个键；`group` 是包含它的最近的已知分组
     Unknown {
         group: Option<&'a GroupMeta>,
@@ -801,8 +813,15 @@ impl MetadataSet {
                     _ => KeyMatch::Within(property),
                 };
             }
-            if group.is_none() {
-                group = self.group(ancestor);
+            if let Some(found) = self.group(ancestor) {
+                // 更近的已声明分组（`catalog.entries.fixed` 是 Map `catalog.entries` 里的一个具名 Pojo）
+                // 决定：它里面的键照常检查，外层的 Map 只在没有更近的分组时才让键开放
+                if group.is_none() && found.ty.as_deref().is_some_and(is_jdk_map) {
+                    return KeyMatch::WithinGroup(found);
+                }
+                if group.is_none() {
+                    group = Some(found);
+                }
             }
         }
         KeyMatch::Unknown { group }
@@ -961,5 +980,95 @@ mod tests {
             KeyMatch::Unknown { group: None }
         ));
         assert!(matches!(set.resolve("server"), KeyMatch::Group(_)));
+    }
+
+    /// 类型是 `Map` 的分组是开放的：`sms.blends.任意名字.任意键` 都不算未知的键。
+    #[test]
+    fn map_typed_group_accepts_any_key() {
+        let text = r#"{
+          "groups": [
+            { "name": "sms", "type": "a.Sms" },
+            { "name": "sms.blends", "type": "java.util.Map" }
+          ],
+          "properties": [{ "name": "sms.config-type", "type": "java.lang.String" }]
+        }"#;
+        let mut meta = ConfigMetadata::default();
+        let mut hints = Vec::new();
+        parse_metadata_json(text, &mut meta, &mut hints);
+        let set = MetadataSet {
+            layers: [
+                Arc::new(ConfigMetadata::default()),
+                Arc::new(ConfigMetadata::default()),
+                Arc::new(meta),
+            ],
+        };
+        assert!(matches!(
+            set.resolve("sms.blends.config1.supplier"),
+            KeyMatch::WithinGroup(group) if group.name == "sms.blends"
+        ));
+        assert!(matches!(
+            set.resolve("sms.blends.config1.templates[0].id"),
+            KeyMatch::WithinGroup(_)
+        ));
+        assert!(matches!(set.resolve("sms.blends"), KeyMatch::Group(_)));
+        assert!(matches!(
+            set.resolve("sms.typo"),
+            KeyMatch::Unknown { group: Some(_) }
+        ));
+    }
+
+    /// 名字以 `Map` 结尾不代表它是 Map：类型不是已知的 JDK Map 时，分组照常检查键。
+    #[test]
+    fn group_named_like_a_map_is_not_open() {
+        let text = r#"{
+          "groups": [{ "name": "road", "type": "example.RoadMap" }],
+          "properties": [{ "name": "road.title", "type": "java.lang.String" }]
+        }"#;
+        let mut meta = ConfigMetadata::default();
+        let mut hints = Vec::new();
+        parse_metadata_json(text, &mut meta, &mut hints);
+        let set = MetadataSet {
+            layers: [
+                Arc::new(ConfigMetadata::default()),
+                Arc::new(ConfigMetadata::default()),
+                Arc::new(meta),
+            ],
+        };
+        assert!(matches!(
+            set.resolve("road.title-typo"),
+            KeyMatch::Unknown { group: Some(_) }
+        ));
+    }
+
+    /// 更近的、已声明的分组决定：Map 分组下面的某个键如果自己是个声明过的普通分组，
+    /// 它里面的拼写错误照常报；Map 里其它任意的键仍然都算合法。
+    #[test]
+    fn declared_group_inside_a_map_group_is_still_checked() {
+        let text = r#"{
+          "groups": [
+            { "name": "catalog", "type": "example.Catalog" },
+            { "name": "catalog.entries", "type": "java.util.Map<java.lang.String,example.Pojo>" },
+            { "name": "catalog.entries.fixed", "type": "example.Pojo" }
+          ],
+          "properties": [{ "name": "catalog.entries.fixed.title", "type": "java.lang.String" }]
+        }"#;
+        let mut meta = ConfigMetadata::default();
+        let mut hints = Vec::new();
+        parse_metadata_json(text, &mut meta, &mut hints);
+        let set = MetadataSet {
+            layers: [
+                Arc::new(ConfigMetadata::default()),
+                Arc::new(ConfigMetadata::default()),
+                Arc::new(meta),
+            ],
+        };
+        assert!(matches!(
+            set.resolve("catalog.entries.fixed.titel"),
+            KeyMatch::Unknown { group: Some(group) } if group.name == "catalog.entries.fixed"
+        ));
+        assert!(matches!(
+            set.resolve("catalog.entries.dynamic.anything"),
+            KeyMatch::WithinGroup(group) if group.name == "catalog.entries"
+        ));
     }
 }

@@ -308,7 +308,8 @@ fn functional_method_id(db: &dyn Db, _ws: base_db::Workspace, class: ClassId) ->
     // 被 default 方法实现掉的抽象方法不算
     let mut implemented: Vec<(Name, usize)> = Vec::new();
 
-    let supers = std::iter::once(class).chain(hir_def::all_supers(db, class));
+    let all_supers = hir_def::all_supers(db, class);
+    let supers = std::iter::once(class).chain(all_supers.iter().copied());
     for sup_class in supers {
         let Some(sup_data) = class_data(db, sup_class) else {
             continue;

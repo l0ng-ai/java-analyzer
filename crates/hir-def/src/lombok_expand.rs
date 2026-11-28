@@ -37,10 +37,17 @@ pub(crate) fn expand(db: &dyn Db, id: ClassId, data: &mut ClassData) {
         return;
     }
     EXPANDING.with(|stack| stack.borrow_mut().push(id));
+    // salsa 的取消以 panic 展开，展开时也要出栈
+    struct PopOnDrop;
+    impl Drop for PopOnDrop {
+        fn drop(&mut self) {
+            EXPANDING.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+    let _guard = PopOnDrop;
     add_delegates(db, id, data);
-    EXPANDING.with(|stack| {
-        stack.borrow_mut().pop();
-    });
 }
 
 fn is_expanding(class: ClassId) -> bool {
@@ -192,7 +199,7 @@ fn add_delegates(db: &dyn Db, id: ClassId, data: &mut ClassData) {
         };
 
         let mut classes = vec![target];
-        classes.extend(all_supers(db, target));
+        classes.extend(all_supers(db, target).iter().copied());
         for class in classes {
             let binary = class.binary_name(db);
             if binary == "java/lang/Object" || class == id || is_expanding(class) {

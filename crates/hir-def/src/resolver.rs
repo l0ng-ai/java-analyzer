@@ -5,8 +5,8 @@
 //! 2. 由内到外每一层类的类型参数、成员类型（含继承来的）；
 //! 3. 单类型 import；
 //! 4. 同一文件的顶层类型、同包类型；
-//! 5. 按需 import（`import a.b.*`）；
-//! 6. `java.lang`。
+//! 5. 按需 import（`import a.b.*`，含隐式的 `java.lang.*`）；
+//! 6. 模块导入。
 
 use std::sync::Arc;
 
@@ -314,35 +314,10 @@ fn resolve_in_file(db: &dyn Db, file: SourceFile, name: &str) -> Option<ClassId>
         return Some(found);
     }
 
-    for import in scope.imports().iter().filter(|i| i.is_on_demand) {
-        if !import.is_static {
-            let package = import.segments.join("/");
-            // 按需 import 只带进别的包里的 public 类（`java.io.*` 不会带进包私有的 `java.io.FileSystem`）
-            let found =
-                lookup_class_from(db, Some(file), &format!("{package}/{name}")).filter(|found| {
-                    class_header(db, *found)
-                        .is_none_or(|data| data.flags.visibility() == crate::Visibility::Public)
-                });
-            if found.is_some() {
-                return found;
-            }
-        }
-        // `import a.b.Outer.*` / `import static a.b.Outer.*` 都能带进成员类型。
-        // 和 javac 一致：非静态的只带进 `Outer` 自己声明的，静态的还包括继承来的。
-        let found = resolve_qualified_class_visible(db, file, &import.segments).and_then(|outer| {
-            if import.is_static {
-                member_type(db, outer, name)
-            } else {
-                nested_class(db, outer, name)
-            }
-        });
-        if found.is_some() {
-            return found;
-        }
-    }
-
-    if let Some(found) = lookup_class_from(db, Some(file), &format!("java/lang/{name}")) {
-        return Some(found);
+    match on_demand_import_candidates(db, file, name).as_slice() {
+        [single] => return Some(*single),
+        [] => {}
+        _ => return None,
     }
 
     // 模块导入的优先级最低；两个模块导入带进同名的类时有歧义，不选
@@ -350,6 +325,58 @@ fn resolve_in_file(db: &dyn Db, file: SourceFile, name: &str) -> Option<ClassId>
         [single] => Some(*single),
         _ => None,
     }
+}
+
+/// 按需导入（含隐式的 java.lang.*）带进的可访问类型；重复导入同一个类型不产生歧义。
+pub fn on_demand_import_candidates(db: &dyn Db, file: SourceFile, name: &str) -> Vec<ClassId> {
+    let scope = file_scope(db, file);
+    let mut candidates = Vec::new();
+    for import in scope.imports().iter().filter(|i| i.is_on_demand) {
+        let found = if !import.is_static {
+            let package = import.segments.join("/");
+            // 按需 import 只带进别的包里的 public 类（`java.io.*` 不会带进包私有的 `java.io.FileSystem`）
+            lookup_class_from(db, Some(file), &format!("{package}/{name}"))
+        } else {
+            None
+        };
+        // `import a.b.Outer.*` / `import static a.b.Outer.*` 都能带进成员类型。
+        // 和 javac 一致：非静态的只带进 `Outer` 自己声明的，静态的还包括继承来的。
+        let found = found.or_else(|| {
+            resolve_qualified_class_visible(db, file, &import.segments).and_then(|outer| {
+                if import.is_static {
+                    member_type(db, outer, name)
+                } else {
+                    nested_class(db, outer, name)
+                }
+            })
+        });
+        // 类路径已登记的类可能读不到 class 文件；没有头部时保留候选，避免误报类型不存在。
+        if let Some(found) = found.filter(|found| {
+            class_header(db, *found).is_none_or(|data| {
+                (!import.is_static || data.flags.is_static())
+                    && match data.flags.visibility() {
+                        crate::Visibility::Public => true,
+                        crate::Visibility::Private => false,
+                        _ => data.package() == scope.package(),
+                    }
+            })
+        }) {
+            if !candidates.contains(&found) {
+                candidates.push(found);
+            }
+        }
+    }
+    if let Some(found) =
+        lookup_class_from(db, Some(file), &format!("java/lang/{name}")).filter(|found| {
+            class_header(db, *found)
+                .is_none_or(|data| data.flags.visibility() == crate::Visibility::Public)
+        })
+    {
+        if !candidates.contains(&found) {
+            candidates.push(found);
+        }
+    }
+    candidates
 }
 
 /// 在文件 `file` 里解析完全限定名：最外层的类要对这个文件可见（有多份时取这个文件看得到的那一份），

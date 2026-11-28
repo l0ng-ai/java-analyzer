@@ -211,20 +211,21 @@ pub fn javadoc_to_markdown(raw: &str) -> String {
         out.push_str(title);
         out.push_str("**\n");
         for (_, body) in items {
-            let body = render(body);
             if named {
-                // 第一个词是参数名 / 异常类型
+                // 先取参数名 / 异常类型，避免 `<T>` 被当作 HTML 标签去掉。
+                let body = body.trim();
                 let (name, desc) = match body.find(char::is_whitespace) {
-                    Some(i) => (&body[..i], body[i..].trim()),
-                    None => (body.as_str(), ""),
+                    Some(i) => (&body[..i], &body[i..]),
+                    None => (body, ""),
                 };
+                let desc = render(desc);
                 if desc.is_empty() {
                     out.push_str(&format!("\n- `{name}`"));
                 } else {
                     out.push_str(&format!("\n- `{name}` — {desc}"));
                 }
             } else {
-                out.push_str(&format!("\n- {body}"));
+                out.push_str(&format!("\n- {}", render(body)));
             }
         }
     };

@@ -333,7 +333,7 @@ pub(crate) fn goto_definition(
 pub(crate) fn super_methods(db: &dyn Db, method: MethodId) -> Vec<MethodId> {
     let target = Definition::Method(method);
     let mut res = Vec::new();
-    for sup in all_supers(db, method.class) {
+    for sup in all_supers(db, method.class).iter().copied() {
         let Some(data) = class_data(db, sup) else {
             continue;
         };
@@ -654,6 +654,12 @@ pub(crate) fn goto_implementation(
                 if !duplicate {
                     targets.push(server);
                 }
+            }
+            // 默认方法找不到其他实现时，其方法体就是可跳转的实现。
+            if targets.is_empty()
+                && ide_db::definition_flags(db, &def).contains(hir::Modifiers::DEFAULT)
+            {
+                targets.extend(to_nav(db, &def));
             }
         }
         // Spring 注入点（字段、构造器形参 …）的"实现"是注入进来的 Bean 定义

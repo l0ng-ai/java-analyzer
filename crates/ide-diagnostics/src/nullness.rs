@@ -488,7 +488,7 @@ impl<'a> Ctx<'a> {
         if let Some(supers) = self.supers.borrow().get(&class) {
             return supers.clone();
         }
-        let supers = Arc::new(hir::all_supers(self.db, class));
+        let supers = hir::all_supers(self.db, class);
         self.supers.borrow_mut().insert(class, supers.clone());
         supers
     }
@@ -841,7 +841,7 @@ fn has_annotated_supers(db: &dyn Db, class: ClassId) -> bool {
 // 跨文件共用：每个文件都要查一遍用到的类，逐个文件重算祖先太慢
 #[salsa::tracked]
 fn has_annotated_supers_tracked(db: &dyn Db, _ws: base_db::Workspace, class: ClassId) -> bool {
-    hir::all_supers(db, class).into_iter().any(|sup| {
+    hir::all_supers(db, class).iter().copied().any(|sup| {
         class_data(db, sup).is_some_and(|data| {
             data.methods.iter().any(|m| {
                 m.flags.null_annotation() != NullAnnotation::Unknown

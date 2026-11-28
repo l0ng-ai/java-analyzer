@@ -117,7 +117,7 @@ pub(crate) fn hover(
     let set = MetadataSet::load(db);
     let info = match set.resolve(&key) {
         KeyMatch::Property(property) | KeyMatch::Within(property) => property_hover(db, property),
-        KeyMatch::Group(group) => group_hover(group),
+        KeyMatch::Group(group) | KeyMatch::WithinGroup(group) => group_hover(group),
         KeyMatch::Unknown { .. } => return None,
     };
     Some(RangeInfo { range, info })
@@ -171,7 +171,7 @@ pub(crate) fn goto_definition(
             Some(decl) => decl_definition(decl),
             None => library_member(db, property.source_type.as_deref()?, &property.name)?,
         },
-        KeyMatch::Group(group) => match group.class {
+        KeyMatch::Group(group) | KeyMatch::WithinGroup(group) => match group.class {
             Some(class) => Definition::Class(class),
             None => {
                 let ty = group.ty.as_deref().or(group.source_type.as_deref())?;

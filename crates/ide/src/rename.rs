@@ -3,7 +3,7 @@
 //! 收集定义本身、它的全部引用，以及必须跟着一起改名的关联声明：
 //! - 方法：整条覆写链上的所有声明；
 //! - 类：它的构造器声明，以及与类同名的源文件；
-//! - 记录组件：同名的访问器调用；
+//! - 记录组件：同名的访问器调用，以及规范构造器（含紧凑构造器）里同名的形参；
 //! - 字段：Lombok 生成的 getter / setter / wither / 构建器方法的调用，换成按新字段名生成的名字。
 //!   反过来，在这些生成的访问器上重命名等于重命名字段（`getName` → `getTitle` 把字段改成 `title`）。
 //!
@@ -12,8 +12,8 @@
 
 use base_db::Db;
 use hir::{
-    class_data, method_sig, AccessorKind, ClassId, ClassKind, Definition, FieldData, FieldId,
-    MethodId, Modifiers, Name, Semantics, Ty,
+    class_data, method_sig, AccessorKind, BodyId, ClassId, ClassKind, Definition, FieldData,
+    FieldId, LocalDef, MethodId, Modifiers, Name, Semantics, Ty,
 };
 use ide_db::{
     overrides::{overridden_methods, same_ty, OverriddenMethod},
@@ -21,7 +21,10 @@ use ide_db::{
     TextEdit,
 };
 use rustc_hash::FxHashSet;
-use syntax::{ast, TextRange};
+use syntax::{
+    ast::{self, AstNode},
+    SyntaxKind, TextRange,
+};
 
 use crate::{
     navigation::{all_subclasses, definition_at, position_file, super_methods},
@@ -107,8 +110,70 @@ fn is_constructor(db: &dyn Db, method: MethodId) -> bool {
 fn rename_target(db: &dyn Db, def: Definition) -> Definition {
     match def {
         Definition::Method(method) if is_constructor(db, method) => Definition::Class(method.class),
+        // 规范构造器的形参与记录组件同名，在它上面改名等于改组件
+        Definition::Local(local) => canonical_ctor_params(db, local.body.class())
+            .into_iter()
+            .find(|(_, param)| *param == local)
+            .map_or(Definition::Local(local), |(field, _)| {
+                Definition::Field(field)
+            }),
         other => other,
     }
+}
+
+/// 记录的规范构造器的形参，与它们对应的组件。规范构造器的形参名必须与组件名相同
+/// （JLS 8.10.4），所以它们跟着组件一起改名：紧凑构造器 `Point { … }` 的隐式形参
+/// （声明位置就是组件的名字），以及显式写出的 `Point(int x, int y) { … }` 的形参。
+fn canonical_ctor_params(db: &dyn Db, record: ClassId) -> Vec<(FieldId, LocalDef)> {
+    let Some(data) = class_data(db, record).filter(|d| d.kind == ClassKind::Record) else {
+        return Vec::new();
+    };
+    // 记录不能声明实例字段，实例字段就是组件，按声明顺序
+    let components: Vec<FieldId> = (0..data.fields.len() as u32)
+        .filter(|&idx| !data.fields[idx as usize].flags.is_static())
+        .map(|idx| FieldId { class: record, idx })
+        .collect();
+    let mut res = Vec::new();
+    for (idx, _) in data.constructors() {
+        let method = MethodId { class: record, idx };
+        let body = BodyId::Method(method);
+        let Some(ctor) =
+            hir::body_syntax(db, body).and_then(|(_, node)| ast::ConstructorDecl::cast(node))
+        else {
+            continue;
+        };
+        let name_ranges: Vec<TextRange> = match ctor.param_list() {
+            None => components
+                .iter()
+                .filter_map(|&field| Some(Definition::Field(field).source(db)?.focus_range))
+                .collect(),
+            Some(list) => {
+                let sig = method_sig(db, method);
+                let canonical = sig.params.len() == components.len()
+                    && sig
+                        .params
+                        .iter()
+                        .zip(&components)
+                        .all(|(param, &field)| *param == hir::field_ty(db, field));
+                if !canonical {
+                    continue;
+                }
+                list.params()
+                    .filter_map(|param| Some(param.name()?.syntax().text_range()))
+                    .collect()
+            }
+        };
+        if name_ranges.len() != components.len() {
+            continue;
+        }
+        let result = hir::infer(db, body);
+        for (&field, range) in components.iter().zip(name_ranges) {
+            if let Some(id) = result.local_at_decl(range) {
+                res.push((field, LocalDef { body, id }));
+            }
+        }
+    }
+    res
 }
 
 pub(crate) fn prepare_rename(
@@ -406,11 +471,57 @@ fn check_conflicts(db: &dyn Db, def: &Definition, new_name: &str) -> Result<(), 
     match def {
         Definition::Local(local) => {
             let result = hir::infer(db, local.body);
-            let clash = result
-                .locals()
+            // 局部类、匿名类的类体是单独的作用域：里面同名的局部符号只遮蔽它自己的类体，
+            // 只有这个类体里用到了被改名的符号（改名后会被它捕获）才冲突
+            let body_node = hir::body_syntax(db, local.body).map(|(_, node)| node);
+            let class_bodies: Vec<TextRange> = body_node
                 .iter()
-                .enumerate()
-                .any(|(id, other)| id as u32 != local.id && other.name == new_name);
+                .flat_map(|node| node.descendants())
+                .filter(|n| n.kind() == SyntaxKind::CLASS_BODY)
+                .map(|n| n.text_range())
+                .collect();
+            let scope_of = |range: TextRange| {
+                class_bodies
+                    .iter()
+                    .filter(|body| body.contains_range(range))
+                    .min_by_key(|body| body.len())
+                    .copied()
+            };
+            let own_scope = scope_of(result.local(local.id).decl_range);
+            let uses: Vec<TextRange> = result
+                .resolutions()
+                .filter(|(_, r)| matches!(r, hir::Resolution::Local(id) if *id == local.id))
+                .map(|(range, _)| range)
+                .collect();
+            let used_in = |body: Option<TextRange>| {
+                body.is_some_and(|body| uses.iter().any(|u| body.contains_range(*u)))
+            };
+            let clash = result.locals().iter().enumerate().any(|(id, other)| {
+                if id as u32 == local.id || other.name != new_name {
+                    return false;
+                }
+                // 被改名的符号自己在局部类、匿名类里时照旧：方法体里有同名的局部符号就冲突
+                // （改名后可能遮蔽外层的同名符号）
+                let scope = scope_of(other.decl_range);
+                own_scope.is_some() || scope == own_scope || used_in(scope)
+            });
+            // 局部类、匿名类里同名的字段：类体里用到了被改名的符号时，改名后会被字段捕获；
+            // 被改名的符号自己声明在这个类里时只是合法地遮蔽自己类的字段
+            let own_decl = result.local(local.id).decl_range;
+            let field_capture = body_node
+                .iter()
+                .flat_map(|node| node.descendants())
+                .filter_map(ast::FieldDecl::cast)
+                .filter(|field| {
+                    field
+                        .declarators()
+                        .any(|d| d.name().is_some_and(|n| n.text() == new_name))
+                })
+                .any(|field| {
+                    let scope = scope_of(field.syntax().text_range());
+                    !scope.is_some_and(|body| body.contains_range(own_decl)) && used_in(scope)
+                });
+            let clash = clash || field_capture;
             if clash {
                 return Err(base_db::tr!(
                     "这个方法体里已经有名为 `{new_name}` 的局部符号",
@@ -661,6 +772,15 @@ pub(crate) fn rename(
                         add_references(&method, &mut items);
                     }
                 }
+            }
+            if let Some((_, param)) = canonical_ctor_params(db, field.class)
+                .into_iter()
+                .find(|(f, _)| f == field)
+            {
+                // 构造器体里可能已经有叫新名字的局部变量
+                check_conflicts(db, &Definition::Local(param), new_name)?;
+                add_declaration(&Definition::Local(param), &mut items);
+                add_references(&Definition::Local(param), &mut items);
             }
         }
         Definition::Local(_) | Definition::TypeParam(_) => {

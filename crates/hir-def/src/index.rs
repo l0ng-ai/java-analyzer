@@ -40,10 +40,13 @@ pub fn item_tree_and_map(db: &dyn Db, file: SourceFile) -> (Arc<ItemTree>, Arc<S
     (Arc::new(tree), Arc::new(map))
 }
 
+// 没有参数的追踪函数，salsa 会把单元键驻留（intern），每次查询都要拿一次驻留表的分片锁；
+// 单元键的哈希值固定，所有线程的查询都落在同一把锁上，并行分析时互相等待。
+// 带上工作区单例作参数后，查询按它直接取键，不再经过驻留表。
 /// 工作区里的 `lombok.config`：`(所在目录, 文本)`，按目录排序。只读资源文件；结果不变时
 /// （改的是 Spring 配置文件）salsa 不会让下游失效。
 #[salsa::tracked(returns(ref))]
-fn lombok_config_files(db: &dyn Db) -> Vec<(SmolStr, Arc<str>)> {
+fn lombok_config_files(db: &dyn Db, _ws: base_db::Workspace) -> Vec<(SmolStr, Arc<str>)> {
     let mut files: Vec<(SmolStr, Arc<str>)> = workspace(db)
         .resources(db)
         .iter()
@@ -71,7 +74,7 @@ fn lombok_config_tracked(
     _ws: base_db::Workspace,
     dir: SmolStr,
 ) -> crate::lombok::LombokConfig {
-    let files = lombok_config_files(db);
+    let files = lombok_config_files(db, workspace(db));
     // 由近及远
     let mut chain: Vec<&(SmolStr, Arc<str>)> = files
         .iter()
@@ -224,7 +227,10 @@ const CHUNK_SIZE: usize = 128;
 
 /// 工作区源码文件（按文件号排序）和它们的角色。
 #[salsa::tracked]
-fn sorted_workspace_files(db: &dyn Db) -> Arc<Vec<(SourceFile, FileKind)>> {
+fn sorted_workspace_files(
+    db: &dyn Db,
+    _ws: base_db::Workspace,
+) -> Arc<Vec<(SourceFile, FileKind)>> {
     let files = workspace(db).files(db);
     Arc::new(
         files
@@ -237,7 +243,7 @@ fn sorted_workspace_files(db: &dyn Db) -> Arc<Vec<(SourceFile, FileKind)>> {
 
 #[salsa::tracked]
 fn item_tree_chunk(db: &dyn Db, _ws: base_db::Workspace, chunk: u32) -> Arc<ItemTreeChunk> {
-    let files = sorted_workspace_files(db);
+    let files = sorted_workspace_files(db, workspace(db));
     let start = chunk as usize * CHUNK_SIZE;
     let end = (start + CHUNK_SIZE).min(files.len());
     Arc::new(ItemTreeChunk {
@@ -257,7 +263,7 @@ fn item_tree_chunk(db: &dyn Db, _ws: base_db::Workspace, chunk: u32) -> Arc<Item
 /// 大工程里每次按键后的第一次查询因此不用把上万个文件的缓存挨个核对一遍。
 pub fn workspace_item_trees(db: &dyn Db) -> Vec<Arc<ItemTreeChunk>> {
     let ws = workspace(db);
-    let count = sorted_workspace_files(db).len().div_ceil(CHUNK_SIZE);
+    let count = sorted_workspace_files(db, ws).len().div_ceil(CHUNK_SIZE);
     (0..count as u32)
         .map(|chunk| item_tree_chunk(db, ws, chunk))
         .collect()
@@ -312,14 +318,18 @@ fn class_names_chunk(db: &dyn Db, ws: base_db::Workspace, chunk: u32) -> Arc<Cla
 /// 全部工作区源码文件的 [`FileClassNames`]，按文件号顺序分组。
 pub(crate) fn workspace_class_names(db: &dyn Db) -> Vec<Arc<ClassNamesChunk>> {
     let ws = workspace(db);
-    let count = sorted_workspace_files(db).len().div_ceil(CHUNK_SIZE);
+    let count = sorted_workspace_files(db, ws).len().div_ceil(CHUNK_SIZE);
     (0..count as u32)
         .map(|chunk| class_names_chunk(db, ws, chunk))
         .collect()
 }
 
-#[salsa::tracked]
 pub fn source_class_index(db: &dyn Db) -> Arc<SourceClassIndex> {
+    source_class_index_tracked(db, workspace(db))
+}
+
+#[salsa::tracked]
+fn source_class_index_tracked(db: &dyn Db, _ws: base_db::Workspace) -> Arc<SourceClassIndex> {
     let mut index = SourceClassIndex::default();
     let chunks = workspace_class_names(db);
     let files = chunks.iter().flat_map(|chunk| chunk.files.iter());
@@ -686,15 +696,39 @@ pub fn direct_supers(db: &dyn Db, id: ClassId) -> Arc<Vec<ClassId>> {
         return Arc::default();
     }
     RESOLVING_SUPERS.with(|stack| stack.borrow_mut().push(id));
-    let res = direct_supers_query(db, id);
-    RESOLVING_SUPERS.with(|stack| {
-        stack.borrow_mut().pop();
-    });
-    res
+    // salsa 的取消以 panic 展开，展开时也要出栈
+    struct PopOnDrop;
+    impl Drop for PopOnDrop {
+        fn drop(&mut self) {
+            RESOLVING_SUPERS.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+    let _guard = PopOnDrop;
+    direct_supers_query(db, id)
 }
 
 /// 所有祖先类型（不含自身），广度优先；`java.lang.Object` 总在其中（如果存在）。
-pub fn all_supers(db: &dyn Db, id: ClassId) -> Vec<ClassId> {
+/// 按类缓存：子类型判断、可访问性检查和各种"层次结构是否可靠"的判断都反复要同一个类的祖先。
+///
+/// 正在解析某个类的父类型时（`RESOLVING_SUPERS` 非空），`direct_supers` 会为截断循环返回空表，
+/// 这时算出的祖先可能不全，不能进缓存，照旧现算。
+pub fn all_supers(db: &dyn Db, id: ClassId) -> Arc<Vec<ClassId>> {
+    if RESOLVING_SUPERS.with(|stack| !stack.borrow().is_empty()) {
+        return Arc::new(collect_all_supers(db, id));
+    }
+    all_supers_tracked(db, workspace(db), id)
+}
+
+// salsa 的追踪函数要求第一个参数是 salsa 结构体；键是普通值时借工作区单例占位，
+// 多参数的追踪函数会自动把参数驻留。
+#[salsa::tracked]
+fn all_supers_tracked(db: &dyn Db, _ws: base_db::Workspace, id: ClassId) -> Arc<Vec<ClassId>> {
+    Arc::new(collect_all_supers(db, id))
+}
+
+fn collect_all_supers(db: &dyn Db, id: ClassId) -> Vec<ClassId> {
     let mut res: Vec<ClassId> = Vec::new();
     let mut seen: FxHashSet<ClassId> = FxHashSet::default();
     seen.insert(id);
@@ -718,8 +752,15 @@ pub fn all_supers(db: &dyn Db, id: ClassId) -> Vec<ClassId> {
 }
 
 /// 工作区源码类的"直接子类型"表：父类型 → 直接继承它的源码类。编辑方法体不会让它重算。
-#[salsa::tracked]
 pub fn source_direct_subtypes(db: &dyn Db) -> Arc<FxHashMap<ClassId, Vec<ClassId>>> {
+    source_direct_subtypes_tracked(db, workspace(db))
+}
+
+#[salsa::tracked]
+fn source_direct_subtypes_tracked(
+    db: &dyn Db,
+    _ws: base_db::Workspace,
+) -> Arc<FxHashMap<ClassId, Vec<ClassId>>> {
     let mut map: FxHashMap<ClassId, Vec<ClassId>> = FxHashMap::default();
     let index = source_class_index(db);
     let mut names: Vec<&SmolStr> = index.iter().map(|(name, _, _)| name).collect();

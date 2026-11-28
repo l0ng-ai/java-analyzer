@@ -34,8 +34,12 @@ impl LibrarySourceIndex {
     }
 }
 
-#[salsa::tracked]
 pub fn library_source_index(db: &dyn Db) -> Arc<LibrarySourceIndex> {
+    library_source_index_tracked(db, workspace(db))
+}
+
+#[salsa::tracked]
+fn library_source_index_tracked(db: &dyn Db, _ws: base_db::Workspace) -> Arc<LibrarySourceIndex> {
     let mut files: Vec<_> = workspace(db)
         .files(db)
         .iter()

@@ -30,7 +30,8 @@ use syntax::{
 use crate::{
     eval::{self, Lit},
     jdwp::{
-        self, reply_result, signature_to_type_name, tag, Invoke, JdwpEvent, MethodInfo, Value, Vm,
+        self, reply_result, signature_to_type_name, tag, FieldInfo, Invoke, JdwpEvent, MethodInfo,
+        Value, Vm,
     },
     session::{FrameRef, Session, VarRef},
     sources::{relative_source_path, FoundSource},
@@ -140,6 +141,17 @@ fn type_not_value(signature: &str) -> String {
 
 fn no_field_value() -> &'static str {
     trs!("JVM 没有返回字段值", "The JVM returned no field value")
+}
+
+/// 字段的值：静态字段读 `declaring` 类，实例字段读 `object`。
+fn field_value(vm: &Vm, declaring: u64, field: FieldInfo, object: u64) -> anyhow::Result<Val> {
+    let values = if field.is_static() {
+        vm.static_values(declaring, &[field.id])?
+    } else {
+        vm.object_values(object, &[field.id])?
+    };
+    let value = *values.first().context(no_field_value())?;
+    Ok(Val::Jdwp(value, Some(field.signature)))
 }
 
 fn null_pointer(expr: impl std::fmt::Display) -> String {
@@ -323,24 +335,32 @@ impl Session {
             }
         }
         let this = vm.this_object(frame.thread, frame.frame)?;
+        let mut objects = Vec::new();
         if let Some(this) = this.object_id() {
-            let mut objects = vec![this];
+            objects.push(this);
             objects.extend(outer_instances(&vm, this));
-            for object in objects {
-                if let Some(val) = self.object_field(&vm, object, name)? {
-                    return Ok(val);
+        }
+        let lexical = enclosing_classes(&vm, frame.location.class);
+        // 先按词法作用域找：从包着当前代码的那个类开始，字段不按运行时类型分派
+        for &object in &objects {
+            let chain = vm.class_chain(vm.object_type(object)?)?;
+            if let Some(&class) = lexical.iter().find(|c| chain.contains(c)) {
+                if let Some((declaring, field)) = find_field(&vm, class, name)? {
+                    return field_value(&vm, declaring, field, object);
                 }
             }
         }
-        for class in enclosing_classes(&vm, frame.location.class) {
+        for &class in &lexical {
             if let Some((declaring, field)) = find_field(&vm, class, name)? {
                 if field.is_static() {
-                    let value = *vm
-                        .static_values(declaring, &[field.id])?
-                        .first()
-                        .context(no_field_value())?;
-                    return Ok(Val::Jdwp(value, Some(field.signature)));
+                    return field_value(&vm, declaring, field, 0);
                 }
+            }
+        }
+        // 词法上都找不到，才退回对象的运行时类型：子类才有的字段在监视里仍然读得到
+        for &object in &objects {
+            if let Some((declaring, field)) = find_field(&vm, vm.object_type(object)?, name)? {
+                return field_value(&vm, declaring, field, object);
             }
         }
         match self.resolve_simple_type(cx, name)? {
@@ -358,12 +378,13 @@ impl Session {
             "There is no `this` in a static method"
         ))?;
         let Some(qualifier) = qualifier else {
+            // `this` 的静态类型是当前方法所在的类，不是对象的运行时类型
             return Ok(Val::Jdwp(
                 Value::Object {
                     tag: tag::OBJECT,
                     id: this,
                 },
-                None,
+                Some(vm.class_signature(cx.frame.location.class)?),
             ));
         };
         let Val::Type { signature, .. } = self.eval(cx, &qualifier)? else {
@@ -394,19 +415,37 @@ impl Session {
         ))
     }
 
-    /// 对象的字段（实例或静态），没有这个字段时返回 `None`。
-    fn object_field(&mut self, vm: &Vm, object: u64, name: &str) -> anyhow::Result<Option<Val>> {
-        let class = vm.object_type(object)?;
-        let Some((declaring, field)) = find_field(vm, class, name)? else {
-            return Ok(None);
-        };
-        let values = if field.is_static() {
-            vm.static_values(declaring, &[field.id])?
-        } else {
-            vm.object_values(object, &[field.id])?
-        };
-        let value = *values.first().context(no_field_value())?;
-        Ok(Some(Val::Jdwp(value, Some(field.signature))))
+    /// 表达式的静态类型（签名）对应的类。同名的类可以由不同的 ClassLoader 各载入一份，只按签名
+    /// 找会选错：对象不是 null 时从对象自己的类层次（含接口）里找；是 null 时只在这个类已经载入、
+    /// 同名的类又只有一份时才认。
+    fn declared_class(
+        &mut self,
+        cx: &mut Cx,
+        object: u64,
+        signature: &str,
+    ) -> anyhow::Result<Option<u64>> {
+        let vm = cx.vm.clone();
+        if object != 0 {
+            let mut types = vm.class_chain(vm.object_type(object)?)?;
+            let mut i = 0;
+            while i < types.len() {
+                if vm.class_signature(types[i])? == signature {
+                    return Ok(Some(types[i]));
+                }
+                for &interface in vm.interfaces(types[i])?.iter() {
+                    if !types.contains(&interface) {
+                        types.push(interface);
+                    }
+                }
+                i += 1;
+            }
+        }
+        // 接收者是 null：只能按签名找。没载入过（不为了读字段去载入、初始化它，Java 里 `f.x` 不会）
+        // 或者同名的类不止一份时认不出是哪一份，不猜（按报错处理）
+        match vm.classes_by_signature(signature)?.as_slice() {
+            [(_, class, _)] => Ok(Some(*class)),
+            _ => Ok(None),
+        }
     }
 
     fn eval_field_access(&mut self, cx: &mut Cx, access: &ast::FieldAccess) -> anyhow::Result<Val> {
@@ -428,11 +467,7 @@ impl Session {
                         field.is_static(),
                         tr!("`{name}` 不是静态字段", "`{name}` is not a static field")
                     );
-                    let value = *vm
-                        .static_values(declaring, &[field.id])?
-                        .first()
-                        .context(no_field_value())?;
-                    return Ok(Val::Jdwp(value, Some(field.signature)));
+                    return field_value(&vm, declaring, field, 0);
                 }
                 let nested = format!("{}${name}", signature_to_type_name(&signature));
                 match self.class_by_name(cx, &nested)? {
@@ -448,31 +483,48 @@ impl Session {
                 "String 没有可访问的字段 `{name}`",
                 "String has no accessible field `{name}`"
             )),
-            Val::Jdwp(value, _) => {
-                let id = match value {
-                    Value::Object { id: 0, .. } => {
-                        bail!(null_pointer(receiver_expr.syntax().text()))
-                    }
-                    Value::Object { id, .. } => id,
-                    _ => bail!(tr!(
+            Val::Jdwp(value, declared) => {
+                let Value::Object { id, .. } = value else {
+                    bail!(tr!(
                         "`{}` 是基本类型，没有字段 `{name}`",
                         "`{}` is a primitive and has no field `{name}`",
                         receiver_expr.syntax().text()
-                    )),
+                    ));
                 };
-                if name == "length" && vm.class_signature(vm.object_type(id)?)?.starts_with('[') {
+                if id != 0
+                    && name == "length"
+                    && vm.class_signature(vm.object_type(id)?)?.starts_with('[')
+                {
                     return Ok(Val::Jdwp(
                         Value::Int(vm.array_length(id)?),
                         Some("I".to_owned()),
                     ));
                 }
-                self.object_field(&vm, id, &name)?.with_context(|| {
-                    tr!(
+                // 字段不按运行时类型分派：先在表达式的静态类型里找，找不到才退回运行时类型
+                let mut found = None;
+                if let Some(signature) = declared.as_deref().filter(|s| s.starts_with('L')) {
+                    if let Some(class) = self.declared_class(cx, id, signature)? {
+                        found = find_field(&vm, class, &name)?;
+                    }
+                }
+                if found.is_none() && id != 0 {
+                    found = find_field(&vm, vm.object_type(id)?, &name)?;
+                }
+                let Some((declaring, field)) = found else {
+                    if id == 0 {
+                        bail!(null_pointer(receiver_expr.syntax().text()));
+                    }
+                    bail!(tr!(
                         "`{}` 没有字段 `{name}`",
                         "`{}` has no field `{name}`",
                         receiver_expr.syntax().text()
-                    )
-                })
+                    ));
+                };
+                // 静态字段不读接收者，接收者是 null 也合法
+                if id == 0 && !field.is_static() {
+                    bail!(null_pointer(receiver_expr.syntax().text()));
+                }
+                field_value(&vm, declaring, field, id)
             }
         }
     }

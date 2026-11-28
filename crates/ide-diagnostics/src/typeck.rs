@@ -865,16 +865,15 @@ fn unimplemented_abstract_methods(
 ) -> Vec<String> {
     // 直接父类不是抽象类时，父类那条继承链上的抽象方法由父类负责（javac 也只在父类上报）。
     // 枚举常量的类体例外：枚举可以把抽象方法留给每个常量的类体实现
-    let settled_by_superclass: Vec<ClassId> = hir::direct_supers(db, class)
-        .iter()
-        .copied()
-        .filter(|sup| {
-            class_header(db, *sup).is_some_and(|d| {
-                !d.is_interface() && !d.flags.is_abstract() && d.kind != ClassKind::Enum
-            })
-        })
-        .flat_map(|sup| std::iter::once(sup).chain(hir::all_supers(db, sup)))
-        .collect();
+    let mut settled_by_superclass: Vec<ClassId> = Vec::new();
+    for sup in hir::direct_supers(db, class).iter().copied() {
+        if class_header(db, sup).is_some_and(|d| {
+            !d.is_interface() && !d.flags.is_abstract() && d.kind != ClassKind::Enum
+        }) {
+            settled_by_superclass.push(sup);
+            settled_by_superclass.extend(hir::all_supers(db, sup).iter().copied());
+        }
+    }
     // 继承链上任何地方有非抽象的、同名且形参类型覆写等价、返回类型兼容的方法，就认为实现了。
     // 同名的静态方法是另一种错误（静态方法不能隐藏实例方法），这里按"有实现"处理
     let implements = |concrete: &InheritedMethod, abstract_method: &InheritedMethod| {
@@ -1015,6 +1014,7 @@ fn override_checks(
     db: &dyn Db,
     method: MethodId,
     name_range: TextRange,
+    override_range: Option<TextRange>,
     out: &mut Vec<Diagnostic>,
 ) {
     let Some(decl) = hir::method_data(db, method) else {
@@ -1036,7 +1036,12 @@ fn override_checks(
     } else {
         visibility_rank(decl.flags.visibility())
     };
-    for overridden in overridden_methods(db, method).methods {
+    let overridden = overridden_methods(db, method);
+    // 有判断不了的同名方法时，不能断定 @Override 没有覆写任何方法
+    let mut unmatched_annotation =
+        override_range.filter(|_| !overridden.undecided && !overridden.uncertain);
+
+    for overridden in overridden.methods {
         let candidate_id = overridden.method;
         let (subst, erase, exact) = (overridden.subst, overridden.erase, overridden.exact);
         let (Some(owner_data), Some(candidate)) = (
@@ -1050,6 +1055,16 @@ fn override_checks(
         } else {
             visibility_rank(candidate.flags.visibility())
         };
+        if !candidate.flags.is_static()
+            && !decl.flags.is_static()
+            && decl.flags.visibility() != Visibility::Private
+            && (!data.is_interface()
+                || owner_data.binary_name != "java/lang/Object"
+                // 接口上标注 @Override 只能重声明 Object 的 public（级别 3）方法。
+                || super_rank == 3)
+        {
+            unmatched_annotation = None;
+        }
         let super_sig = method_sig(db, candidate_id);
         let owner_name = &owner_data.name;
         if candidate.flags.is_static() != decl.flags.is_static() {
@@ -1107,6 +1122,29 @@ fn override_checks(
             ));
             return;
         }
+    }
+    if let Some(range) = unmatched_annotation.filter(|_| {
+        hierarchy_is_resolved(db, method.class)
+            && hir::lookup_class(db, "java/lang/Object").is_some()
+            && !std::iter::once(method.class)
+                .chain(hir::all_supers(db, method.class).iter().copied())
+                .any(|class| lombok_involved(db, class))
+            // JLS 9.6.4.4 也允许显式声明的记录组件访问器标注 @Override。
+            && !(data.kind == ClassKind::Record
+                && decl.params.is_empty()
+                && !decl.flags.is_static()
+                && class_data(db, method.class).is_some_and(|data| {
+                    data.fields.iter().any(|field| !field.flags.is_static() && field.name == decl.name)
+                }))
+    }) {
+        out.push(error(
+            range,
+            DiagnosticCode::InvalidOverride,
+            base_db::tr!(
+                "方法没有覆写或实现父类型中的方法",
+                "Method does not override or implement a method from a supertype"
+            ),
+        ));
     }
 }
 
@@ -2096,7 +2134,27 @@ fn declaration_checks(view: &View<'_>, out: &mut Vec<Diagnostic>) {
                 sema.method_of_decl(file, &node)
             };
             if let (Some(id), Some(name)) = (id, method.name()) {
-                override_checks(db, id, name.syntax().text_range(), out);
+                let override_range = method
+                    .modifier_list()
+                    .into_iter()
+                    .flat_map(|mods| mods.annotations())
+                    .chain(
+                        method
+                            .type_param_list()
+                            .and_then(|_| method.return_type())
+                            .into_iter()
+                            .flat_map(|ty| ty.syntax().descendants().filter_map(ast::Annotation::cast)),
+                    )
+                    .filter_map(|a| a.name())
+                    .find(|ann| {
+                        ann.name_ref().is_some_and(|n| n.text() == "Override")
+                            && matches!(
+                                hir::resolve_type_path(db, &sema.type_scope(file, ann.syntax()), &ann.segments()),
+                                Some(hir::TypeNs::Class(class)) if class.binary_name(db) == "java/lang/Override"
+                            )
+                    })
+                    .map(|ann| ann.syntax().text_range());
+                override_checks(db, id, name.syntax().text_range(), override_range, out);
             }
         }
     }

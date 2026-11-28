@@ -6,8 +6,8 @@
 
 use base_db::Db;
 use hir::{
-    all_super_tys, class_data, class_header, method_sig, ClassId, GenericOwner, MethodId, Subst,
-    Ty, Visibility,
+    all_super_tys, class_data, class_header, method_sig, ClassId, GenericOwner, MethodId,
+    Modifiers, Subst, Ty, Visibility, Wildcard,
 };
 
 /// `method` 覆写（或者以静态方法隐藏）的一个祖先方法。
@@ -25,6 +25,9 @@ pub struct Overridden {
     pub methods: Vec<OverriddenMethod>,
     /// 有同名、同参数个数的继承方法因为形参类型解析不出来而判断不了
     pub undecided: bool,
+    /// 可能漏掉了被覆写的方法：有父类型读不到成员，或者有同名、同参数个数的继承方法签名
+    /// 不同、但其中含没有代换掉的类型参数（菱形匿名类可能丢了推断出的父类型实参）
+    pub uncertain: bool,
 }
 
 /// `method` 覆写（或者以静态方法隐藏）的祖先方法，按父类型的广度优先顺序。
@@ -32,6 +35,7 @@ pub fn overridden_methods(db: &dyn Db, method: MethodId) -> Overridden {
     let mut res = Overridden {
         methods: Vec::new(),
         undecided: false,
+        uncertain: false,
     };
     let (Some(decl), Some(data)) = (hir::method_data(db, method), class_header(db, method.class))
     else {
@@ -56,6 +60,7 @@ pub fn overridden_methods(db: &dyn Db, method: MethodId) -> Overridden {
         }
         let erase = raw.contains(&owner);
         let Some(owner_data) = class_data(db, owner) else {
+            res.uncertain = true;
             continue;
         };
         let class_subst = Subst::for_class(db, owner, args);
@@ -110,7 +115,8 @@ pub fn overridden_methods(db: &dyn Db, method: MethodId) -> Overridden {
                     );
                 }
             }
-            let super_params: Vec<Ty> = method_sig(db, candidate_id)
+            let super_sig = method_sig(db, candidate_id);
+            let super_params: Vec<Ty> = super_sig
                 .params
                 .iter()
                 .map(|p| erase_if(db, p.subst(&subst), erase))
@@ -138,6 +144,20 @@ pub fn overridden_methods(db: &dyn Db, method: MethodId) -> Overridden {
                     erase,
                     exact,
                 });
+            } else if !candidate.flags.is_static()
+                && (sig
+                    .params
+                    .iter()
+                    .chain(&super_params)
+                    .any(|p| p.mentions_params_where(&|_| true))
+                    || (data.flags.contains(Modifiers::ANONYMOUS)
+                        && erase
+                        && super_sig
+                            .params
+                            .iter()
+                            .any(|p| p.mentions_params_where(&|_| true))))
+            {
+                res.uncertain = true;
             }
         }
     }
@@ -149,11 +169,11 @@ pub fn overridden_methods(db: &dyn Db, method: MethodId) -> Overridden {
 /// `implements Foo` 时 `Supplier<Optional<T>> get()` 的签名是 `Supplier get()`。
 pub fn raw_inherited_classes(db: &dyn Db, class: ClassId) -> rustc_hash::FxHashSet<ClassId> {
     let mut raw = rustc_hash::FxHashSet::default();
-    for current in std::iter::once(class).chain(hir::all_supers(db, class)) {
+    for current in std::iter::once(class).chain(hir::all_supers(db, class).iter().copied()) {
         for sup in hir::class_supertypes(db, current).iter() {
             if let Ty::Class(id, _) = sup {
                 if is_raw(db, sup) && raw.insert(*id) {
-                    raw.extend(hir::all_supers(db, *id));
+                    raw.extend(hir::all_supers(db, *id).iter().copied());
                 }
             }
         }
@@ -179,11 +199,31 @@ pub fn visibility_rank(visibility: Visibility) -> u8 {
 }
 
 /// 两个类型相同：结构相同，或者不含类型参数时全限定名相同（同名类的两份副本）。
+/// 无界通配符 `?` 与 `? extends Object` 也等价。
 pub fn same_ty(db: &dyn Db, a: &Ty, b: &Ty) -> bool {
-    a == b
+    if a == b
         || (!a.mentions_params_where(&|_| true)
             && !b.mentions_params_where(&|_| true)
             && a.display_qualified(db) == b.display_qualified(db))
+    {
+        return true;
+    }
+    // 类型参数 T 代换成 Object 后，`? extends T` 与 `?` 等价。
+    match (a, b) {
+        (Ty::Wildcard(Wildcard::Unbounded), Ty::Wildcard(Wildcard::Extends(bound)))
+        | (Ty::Wildcard(Wildcard::Extends(bound)), Ty::Wildcard(Wildcard::Unbounded)) => {
+            same_ty(db, bound, &Ty::object(db))
+        }
+        (Ty::Class(ac, aa), Ty::Class(bc, ba)) => {
+            ac.binary_name(db) == bc.binary_name(db)
+                && aa.len() == ba.len()
+                && aa.iter().zip(ba.iter()).all(|(a, b)| same_ty(db, a, b))
+        }
+        (Ty::Array(a), Ty::Array(b))
+        | (Ty::Wildcard(Wildcard::Extends(a)), Ty::Wildcard(Wildcard::Extends(b)))
+        | (Ty::Wildcard(Wildcard::Super(a)), Ty::Wildcard(Wildcard::Super(b))) => same_ty(db, a, b),
+        _ => false,
+    }
 }
 
 /// 类类型是原始类型（泛型类不带类型实参）。

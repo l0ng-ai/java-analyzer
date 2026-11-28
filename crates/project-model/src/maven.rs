@@ -61,6 +61,15 @@ struct RawDep {
 }
 
 impl RawDep {
+    fn managed_key(&self) -> ManagedKey {
+        (
+            self.group.clone(),
+            self.artifact.clone(),
+            self.kind.clone().unwrap_or_else(|| "jar".to_owned()),
+            self.classifier.clone(),
+        )
+    }
+
     fn coord(&self) -> Coord {
         Coord {
             group: self.group.clone(),
@@ -431,7 +440,9 @@ struct Managed {
     system_path: Option<String>,
 }
 
-type ManagedKey = (String, String, Option<String>);
+// 受管的 `<type>pom</type>` 只管同样是 pom 类型的依赖（Maven 的键里有 type）：
+// `kotlin-bom` 管理的 `kotlin-stdlib-common:pom` 不能改 jar 依赖的版本
+type ManagedKey = (String, String, String, Option<String>);
 
 /// 继承、插值之后的有效 POM。
 #[derive(Clone, Debug, Default)]
@@ -725,26 +736,16 @@ impl Resolver {
         let mut boms: Vec<RawDep> = Vec::new();
         for dep in &eff.raw_managed {
             let dep = interpolate_dep(dep, &eff.properties);
-            if dep.kind.as_deref() == Some("pom") {
-                if dep.scope.as_deref() == Some("import") {
-                    boms.push(dep);
-                }
-                // 受管的 `<type>pom</type>` 只管同样是 pom 类型的依赖（Maven 的键里有 type）：
-                // `kotlin-bom` 管理的 `kotlin-stdlib-common:pom` 不能改 jar 依赖的版本
+            if dep.kind.as_deref() == Some("pom") && dep.scope.as_deref() == Some("import") {
+                boms.push(dep);
                 continue;
             }
-            eff.managed
-                .entry((
-                    dep.group.clone(),
-                    dep.artifact.clone(),
-                    dep.classifier.clone(),
-                ))
-                .or_insert(Managed {
-                    version: dep.version,
-                    scope: dep.scope,
-                    exclusions: dep.exclusions,
-                    system_path: dep.system_path,
-                });
+            eff.managed.entry(dep.managed_key()).or_insert(Managed {
+                version: dep.version,
+                scope: dep.scope,
+                exclusions: dep.exclusions,
+                system_path: dep.system_path,
+            });
         }
         for bom in boms {
             let Some(version) = bom.version.as_deref().map(normalize_version) else {
@@ -912,11 +913,7 @@ impl Resolver {
             if is_excluded(&pending.exclusions, &t_coord) {
                 continue;
             }
-            let key = (
-                transitive.group.clone(),
-                transitive.artifact.clone(),
-                transitive.classifier.clone(),
-            );
+            let key = transitive.managed_key();
             let own_managed = dep_pom.managed.get(&key);
             let root_managed = root.managed.get(&key);
             let raw_scope = transitive
@@ -966,15 +963,11 @@ impl Resolver {
     /// 解析一个模块的传递依赖闭包（广度优先，最近者优先）。
     fn resolve_dependencies(&mut self, root: &Effective) -> Vec<ResolvedDep> {
         let mut result: Vec<ResolvedDep> = Vec::new();
-        let mut seen: FxHashMap<ManagedKey, Seen> = FxHashMap::default();
+        let mut seen: FxHashMap<_, Seen> = FxHashMap::default();
         let mut queue: VecDeque<Pending> = VecDeque::new();
 
         for dep in &root.deps {
-            let key = (
-                dep.group.clone(),
-                dep.artifact.clone(),
-                dep.classifier.clone(),
-            );
+            let key = dep.managed_key();
             let managed = root.managed.get(&key);
             let Some(version) = dep
                 .version
@@ -1019,10 +1012,12 @@ impl Resolver {
         while let Some(pending) = queue.pop_front() {
             let coord = pending.dep.coord();
             let kind = pending.dep.kind.as_deref().unwrap_or("jar");
-            // `test-jar` 和同一模块的普通依赖是两个不同的构件
+            // POM 和 jar 是不同的构件；`test-jar` 和同一模块的普通依赖也是不同的构件，
+            // 但 `test-jar` 和带 `<classifier>tests</classifier>` 的 jar 是同一个构件
             let key = (
                 coord.group.clone(),
                 coord.artifact.clone(),
+                if kind == "pom" { "pom" } else { "jar" },
                 pending
                     .dep
                     .classifier
@@ -2448,6 +2443,112 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec!["g:log:1".to_owned()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn managed_pom_dependencies_keep_transitive_libraries() {
+        let dir = temp_dir("managed-pom");
+        let repo = dir.join("repo");
+        install(&repo, "leaf", "");
+        write(
+            &repo.join("g/bundle/1/bundle-1.pom"),
+            &pom("g", "bundle", &dep("leaf", ""))
+                .replace("<dependencies>", "<packaging>pom</packaging><dependencies>"),
+        );
+        let managed_pom = dep("bundle", "<type>pom</type>");
+        let managed_dep = managed_pom.replace("<version>1</version>", "");
+        let management = |deps: &str| {
+            format!(
+                "<dependencyManagement><dependencies>{deps}</dependencies></dependencyManagement>"
+            )
+        };
+        let project = |name: &str, deps: &str, managed: &str| {
+            pom("g", name, deps)
+                .replace("</project>", &format!("{}</project>", management(managed)))
+        };
+        write(
+            &repo.join("g/bom/1/bom-1.pom"),
+            &project("bom", "", &managed_pom)
+                .replace("<project>", "<project><packaging>pom</packaging>"),
+        );
+        let bom_import = dep("bom", "<type>pom</type><scope>import</scope>");
+        install(&repo, "bridge", "");
+        write(
+            &repo.join("g/bridge/1/bridge-1.pom"),
+            &project("bridge", &managed_dep, &bom_import),
+        );
+        write(&repo.join("g/bundle/2/bundle-2.jar"), "");
+        write(
+            &repo.join("g/bundle/2/bundle-2.pom"),
+            &pom("g", "bundle", "").replace("<version>1</version>", "<version>2</version>"),
+        );
+        let jar_dep = dep("bundle", "").replace("<version>1</version>", "");
+        let managed_jar = dep("bundle", "<type>jar</type>")
+            .replace("<version>1</version>", "<version>2</version>");
+        for (name, deps, managed, expected) in [
+            (
+                "explicit",
+                managed_pom.clone(),
+                String::new(),
+                vec![("leaf", "1")],
+            ),
+            (
+                "own",
+                managed_dep.clone(),
+                managed_pom.clone(),
+                vec![("leaf", "1")],
+            ),
+            (
+                "imported",
+                managed_dep.clone(),
+                bom_import.clone(),
+                vec![("leaf", "1")],
+            ),
+            (
+                "transitive",
+                dep("bridge", ""),
+                String::new(),
+                vec![("bridge", "1"), ("leaf", "1")],
+            ),
+            (
+                "different_types",
+                jar_dep + &managed_dep,
+                managed_pom + &managed_jar,
+                vec![("bundle", "2"), ("leaf", "1")],
+            ),
+        ] {
+            let root_pom = dir.join(name).join("pom.xml");
+            write(&root_pom, &project(name, &deps, &managed));
+            let (import, missing) = import_once(&[root_pom], &repo, None);
+            assert!(missing.is_empty(), "{name}: {missing:?}");
+            assert!(import.messages.is_empty(), "{name}: {:?}", import.messages);
+            let graph = base_db::ProjectGraph {
+                modules: import.modules,
+                libraries: import.libraries,
+                jdk: None,
+            };
+            let jars: Vec<_> = expected
+                .iter()
+                .map(|(name, version)| {
+                    repo.join(format!("g/{name}/{version}/{name}-{version}.jar"))
+                })
+                .collect();
+            assert_eq!(
+                graph
+                    .libraries
+                    .iter()
+                    .map(|lib| lib.jar.clone())
+                    .collect::<Vec<_>>(),
+                jars,
+                "{name}"
+            );
+            assert_eq!(
+                crate::runtime_class_path(&graph, ModuleId(0), false).entries,
+                jars,
+                "{name}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
