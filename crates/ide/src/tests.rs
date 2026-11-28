@@ -103,6 +103,37 @@ class Square implements Shape { public double area() { return 2; } }
 }
 
 #[test]
+fn goto_implementation_of_inherited_default_method() {
+    let fx = fixture(
+        r#"
+interface Service<T> { default String name() { return "service"; } }
+class UserService implements Service<String> {}
+class Caller { String run(Service<String> svc) { return svc.na$0me(); } }
+"#,
+    );
+    let result = navigation::goto_implementation(&fx.db, position(&fx)).unwrap();
+    assert_eq!(result.info.len(), 1);
+    let nav = &result.info[0];
+    assert_eq!(nav.container.as_deref(), Some("Service"));
+    assert_eq!(slice(&fx, &nav.file, nav.focus_range), "name");
+}
+
+#[test]
+fn goto_implementation_of_overridden_default_method() {
+    let fx = fixture(
+        r#"
+interface Service<T> { default String name() { return "service"; } }
+class UserService implements Service<String> {}
+class OtherService implements Service<String> { public String name() { return "other"; } }
+class Caller { String run(Service<String> svc) { return svc.na$0me(); } }
+"#,
+    );
+    let result = navigation::goto_implementation(&fx.db, position(&fx)).unwrap();
+    assert_eq!(result.info.len(), 1);
+    assert_eq!(result.info[0].container.as_deref(), Some("OtherService"));
+}
+
+#[test]
 fn goto_implementation_of_methods_that_cannot_be_overridden() {
     for (source, expected) in [
         ("class A { final void f$0() {} }\nclass B extends A {}\n", 0),
