@@ -533,3 +533,59 @@ public class Dup {
         "外层类的成员应当解析得到: {unresolved:?}"
     );
 }
+
+/// 取消以 panic 展开穿过 `direct_supers`。工作线程常驻，展开后它的线程局部栈里不能留下这个类，
+/// 否则这个线程之后再查它的父类型都得到空：类型层次里看不到父类。
+#[test]
+fn cancelled_query_leaves_no_stale_supers_on_the_thread() {
+    use std::{panic::AssertUnwindSafe, sync::mpsc, thread};
+
+    use base_db::salsa::Cancelled;
+
+    let mut fx = fixture(
+        r#"
+//- /p/Base.java
+package p;
+class Base {}
+//- /p/Child.java
+package p;
+class Chi$0ld extends Base {}
+"#,
+    );
+    let base = source(&fx, "/p/Base.java");
+    let child_id = hir::lookup_class(&fx.db, "p/Child").unwrap();
+    let (_, file_id, offset) = fx.position();
+    let items =
+        crate::hierarchy::prepare_type_hierarchy(&fx.db, crate::FilePosition { file_id, offset })
+            .unwrap();
+    let key = items[0].key.clone().unwrap();
+    let supertypes = move |db: &RootDatabase| -> Vec<String> {
+        crate::hierarchy::supertypes(db, &key)
+            .into_iter()
+            .map(|n| n.name.to_string())
+            .collect()
+    };
+
+    let (db_tx, db_rx) = mpsc::channel::<RootDatabase>();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let db = db_rx.recv().unwrap();
+        // 循环里唯一的取消检查点在 `direct_supers` 压栈之后，所以取消一定在它出栈前展开
+        let cancelled = Cancelled::catch(AssertUnwindSafe(|| loop {
+            hir::direct_supers(&db, child_id);
+        }));
+        assert!(cancelled.is_err());
+        drop(db);
+        let db = db_rx.recv().unwrap();
+        done_tx.send(supertypes(&db)).unwrap();
+    });
+
+    db_tx.send(fx.db.clone()).unwrap();
+    // 写入会取消工作线程上的查询，并等它的快照释放
+    replace(&mut fx.db, base, "class Base {", "class Base { int x;");
+    db_tx.send(fx.db.clone()).unwrap();
+    let on_worker = done_rx.recv().unwrap();
+    worker.join().unwrap();
+
+    assert_eq!(on_worker, ["Base"]);
+}
