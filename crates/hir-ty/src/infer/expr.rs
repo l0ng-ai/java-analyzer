@@ -2973,7 +2973,7 @@ impl InferCtx<'_> {
         }
     }
 
-    /// 引用的是 catch 形参：多重 catch 的形参类型是各个备选的最小上界，这里只记了第一个。
+    /// 引用的是 catch 形参：多重 catch 的形参类型是并集类型，推断里只用最小上界近似。
     fn is_catch_param(&self, expr: &ast::Expr) -> bool {
         let ast::Expr::NameExpr(name) = expr else {
             return false;

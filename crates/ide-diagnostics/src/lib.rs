@@ -1962,6 +1962,44 @@ public class Main {
         assert!(wrong.is_empty(), "{diags:?}");
     }
 
+    /// 多重 catch 的形参按各备选的最小上界参与重载决议（JLS 14.20）：`A | B` 是 `Base`，
+    /// 选 `f(Base)`。javac 编译无错误。
+    #[test]
+    fn multi_catch_parameter_has_the_lub_type() {
+        let diags = check(
+            r#"
+class Base extends Exception {}
+class A extends Base {}
+class B extends Base {}
+public class Main {
+    static String f(A e) { return "a"; }
+    static int f(Base e) { return 1; }
+    static void g() throws A, B {}
+    int use() {
+        try {
+            g();
+        } catch (A | B e) {
+            return f(e);
+        }
+        return 0;
+    }
+}
+"#,
+        );
+        let wrong: Vec<_> = diags
+            .iter()
+            .filter(|(code, _)| {
+                matches!(
+                    code,
+                    DiagnosticCode::TypeMismatch
+                        | DiagnosticCode::ArgumentMismatch
+                        | DiagnosticCode::AmbiguousCall
+                )
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{diags:?}");
+    }
+
     /// 两个同参数个数的泛型构造器竞争、实参里夹着多态表达式（菱形构造）时，
     /// lambda 形参的类型要来自幸存候选解出来的签名，而不是第一个实参的类型。
     /// javac 编译无警告（JLS 18.5.2 / 18.5.4）。

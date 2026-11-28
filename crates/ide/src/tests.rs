@@ -1970,6 +1970,69 @@ class Main {
     );
 }
 
+/// 多重 catch 的形参的类型是各备选的最小上界，不是第一个备选。
+#[test]
+fn multi_catch_parameter_picks_the_lub_overload() {
+    let src = r#"
+class Base extends Exception {}
+class A extends Base {}
+class B extends Base {}
+class Main {
+    static String f(A e) { return "a"; }
+    static int f(Base e) { return 1; }
+    static void g() throws A, B {}
+    void use() {
+        try { g(); } catch (A | B e) { f$0(e); }
+    }
+}
+"#;
+    assert_eq!(constructor_target(src), "static int f(Base e)");
+}
+
+/// 最小上界是交集（`Exception & Marker`、`Base & Marker`）时照旧按第一个备选解析重载和成员。
+#[test]
+fn multi_catch_parameter_with_intersection_lub_keeps_first_alternative() {
+    let overload = r#"
+class Main {
+    interface Marker {}
+    static class A extends Exception implements Marker {}
+    static class B extends Exception implements Marker {}
+    static String f(Object e) { return "wrong"; }
+    static int f(Marker e) { return 1; }
+    int use(boolean flag) {
+        try { if (flag) throw new A(); else throw new B(); }
+        catch (A | B e) { return f$0(e); }
+    }
+}
+"#;
+    assert_eq!(constructor_target(overload), "static int f(Marker e)");
+    let members = r#"
+class Main {
+    interface Marker { int code(); }
+    static class Base extends Exception { public int shared() { return 1; } }
+    static class A extends Base implements Marker { public int code() { return 1; } }
+    static class B extends Base implements Marker { public int code() { return 2; } }
+    int use(boolean flag) {
+        try { if (flag) throw new A(); else throw new B(); }
+        catch (A | B e) { return e.shared$0() + e.code(); }
+    }
+}
+"#;
+    assert_eq!(constructor_target(members), "public int shared()");
+    let generic = r#"
+class Main {
+    interface Marker<T> { T code(); }
+    static class A extends Exception implements Marker<String> { public String code() { return "a"; } }
+    static class B extends Exception implements Marker<String> { public String code() { return "b"; } }
+    String use(boolean flag) {
+        try { if (flag) throw new A(); else throw new B(); }
+        catch (A | B e) { return e.code$0(); }
+    }
+}
+"#;
+    assert_eq!(constructor_target(generic), "public String code()");
+}
+
 /// 菱形构造在 `Box(T)` 和更具体的 `Box(CharSequence)` 之间按 JLS 15.12.2.5 选后者，
 /// 和声明顺序无关；显式给出类型实参时 `T` 已经定下来，照常比较代换后的形参。
 #[test]
