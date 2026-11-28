@@ -711,7 +711,13 @@ pub fn direct_supers(db: &dyn Db, id: ClassId) -> Arc<Vec<ClassId>> {
 
 /// 所有祖先类型（不含自身），广度优先；`java.lang.Object` 总在其中（如果存在）。
 /// 按类缓存：子类型判断、可访问性检查和各种"层次结构是否可靠"的判断都反复要同一个类的祖先。
+///
+/// 正在解析某个类的父类型时（`RESOLVING_SUPERS` 非空），`direct_supers` 会为截断循环返回空表，
+/// 这时算出的祖先可能不全，不能进缓存，照旧现算。
 pub fn all_supers(db: &dyn Db, id: ClassId) -> Arc<Vec<ClassId>> {
+    if RESOLVING_SUPERS.with(|stack| !stack.borrow().is_empty()) {
+        return Arc::new(collect_all_supers(db, id));
+    }
     all_supers_tracked(db, workspace(db), id)
 }
 
@@ -719,6 +725,10 @@ pub fn all_supers(db: &dyn Db, id: ClassId) -> Arc<Vec<ClassId>> {
 // 多参数的追踪函数会自动把参数驻留。
 #[salsa::tracked]
 fn all_supers_tracked(db: &dyn Db, _ws: base_db::Workspace, id: ClassId) -> Arc<Vec<ClassId>> {
+    Arc::new(collect_all_supers(db, id))
+}
+
+fn collect_all_supers(db: &dyn Db, id: ClassId) -> Vec<ClassId> {
     let mut res: Vec<ClassId> = Vec::new();
     let mut seen: FxHashSet<ClassId> = FxHashSet::default();
     seen.insert(id);
@@ -738,7 +748,7 @@ fn all_supers_tracked(db: &dyn Db, _ws: base_db::Workspace, id: ClassId) -> Arc<
             res.push(object);
         }
     }
-    Arc::new(res)
+    res
 }
 
 /// 工作区源码类的"直接子类型"表：父类型 → 直接继承它的源码类。编辑方法体不会让它重算。
