@@ -68,10 +68,10 @@ pub fn literal(token: &SyntaxToken) -> Result<Lit, String> {
             parse_integer(text.trim_end_matches(['l', 'L']), true).ok_or_else(bad)? as i64,
         )),
         SyntaxKind::FLOAT_LITERAL => Lit::Value(Value::Float(
-            parse_floating(text.trim_end_matches(['f', 'F'])).ok_or_else(bad)? as f32,
+            parse_floating(text.trim_end_matches(['f', 'F']), true).ok_or_else(bad)? as f32,
         )),
         SyntaxKind::DOUBLE_LITERAL => Lit::Value(Value::Double(
-            parse_floating(text.trim_end_matches(['d', 'D'])).ok_or_else(bad)?,
+            parse_floating(text.trim_end_matches(['d', 'D']), false).ok_or_else(bad)?,
         )),
         SyntaxKind::CHAR_LITERAL => {
             let inner = text
@@ -118,8 +118,83 @@ fn parse_integer(text: &str, long: bool) -> Option<u64> {
     (value <= limit).then_some(value)
 }
 
-fn parse_floating(text: &str) -> Option<f64> {
-    text.replace('_', "").parse().ok()
+/// 浮点字面量的值。`float` 是 `float` 字面量：十六进制的按 `float` 的精度舍入。
+fn parse_floating(text: &str, float: bool) -> Option<f64> {
+    let text = text.replace('_', "");
+    match text.strip_prefix("0x").or(text.strip_prefix("0X")) {
+        Some(hex) if float => parse_hex_floating(hex, 24, -126, 127),
+        Some(hex) => parse_hex_floating(hex, 53, -1022, 1023),
+        None => text.parse().ok(),
+    }
+}
+
+/// 十六进制浮点字面量（已去掉 `0x`，如 `1.8p2`）：尾数 × 2^指数，指数不能省。
+///
+/// 按目标类型的精度一次舍入（就近，平局取偶，和 javac 一致），不经过中间的浮点运算：尾数很长
+/// 或指数很大时中间结果会溢出。太大（javac 报 floating-point number too large）返回 `None`。
+/// `precision` 是有效位数，`min_exp` / `max_exp` 是规格化数的最小和最大指数
+/// （double：53、-1022、1023，float：24、-126、127）。
+fn parse_hex_floating(text: &str, precision: u32, min_exp: i32, max_exp: i32) -> Option<f64> {
+    let (mantissa, exponent) = text.split_once(['p', 'P'])?;
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if int.is_empty() && frac.is_empty() {
+        return None;
+    }
+    let exponent_digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+    if exponent_digits.is_empty() || !exponent_digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // 写得再大的指数都够用：尾数不是 0 时一定上溢或下溢，是 0 时不影响
+    let saturated = if exponent.starts_with('-') {
+        -(1_i128 << 100)
+    } else {
+        1_i128 << 100
+    };
+    let exponent: i128 = exponent.parse().unwrap_or(saturated);
+
+    // 尾数的有效位（去掉前导 0）
+    let mut bits: Vec<bool> = Vec::new();
+    for digit in int.chars().chain(frac.chars()) {
+        let digit = digit.to_digit(16)?;
+        for shift in (0..4).rev() {
+            let bit = (digit >> shift) & 1 == 1;
+            if bit || !bits.is_empty() {
+                bits.push(bit);
+            }
+        }
+    }
+    if bits.is_empty() {
+        return Some(0.0);
+    }
+    // 最高位的指数，和最低保留位的指数（次正规数保留的位数更少）
+    let top = bits.len() as i128 - 1 + exponent - 4 * frac.len() as i128;
+    if top > i128::from(max_exp) {
+        return None;
+    }
+    let ulp =
+        (top - i128::from(precision) + 1).max(i128::from(min_exp) - i128::from(precision) + 1);
+    let kept = top - ulp + 1;
+    if kept < 0 {
+        // 不到最小次正规数的一半
+        return Some(0.0);
+    }
+    let kept = kept as usize;
+    let mut value = bits
+        .iter()
+        .take(kept)
+        .fold(0_u64, |v, &b| v << 1 | u64::from(b));
+    value <<= kept.saturating_sub(bits.len());
+    let round = bits.get(kept).copied().unwrap_or(false);
+    let sticky = bits.iter().skip(kept + 1).any(|&b| b);
+    if round && (sticky || value & 1 == 1) {
+        value += 1;
+    }
+    let ulp = ulp as i32;
+    if value != 0 && ulp + (63 - value.leading_zeros() as i32) > max_exp {
+        return None;
+    }
+    // 分两次乘：2^ulp 单独算会在次正规数上下溢成 0，每一步都是精确的
+    Some(value as f64 * 2.0_f64.powi(ulp / 2) * 2.0_f64.powi(ulp - ulp / 2))
 }
 
 /// 字符 / 字符串字面量里的转义。
@@ -653,6 +728,79 @@ mod tests {
             lit("\"\"\"\n    hello\n      world\n    \"\"\""),
             Lit::Str("hello\n  world\n".into())
         );
+    }
+
+    fn double_bits(text: &str) -> u64 {
+        match lit(text) {
+            Lit::Value(Value::Double(d)) => d.to_bits(),
+            other => panic!("{text}: {other:?}"),
+        }
+    }
+
+    fn float_bits(text: &str) -> u32 {
+        match lit(text) {
+            Lit::Value(Value::Float(f)) => f.to_bits(),
+            other => panic!("{text}: {other:?}"),
+        }
+    }
+
+    /// 整个文本不是一个能求值的字面量。
+    fn is_rejected(text: &str) -> bool {
+        match parse(text) {
+            Ok(ast::Expr::Literal(literal_expr)) => literal_expr
+                .token()
+                .is_none_or(|token| literal(&token).is_err()),
+            _ => true,
+        }
+    }
+
+    #[test]
+    fn hex_float_literals() {
+        assert_eq!(lit("0x1.8p2"), Lit::Value(Value::Double(6.0)));
+        assert_eq!(lit("0x1.0p-1f"), Lit::Value(Value::Float(0.5)));
+        assert_eq!(lit("0X.8P1"), Lit::Value(Value::Double(1.0)));
+        assert_eq!(lit("0xAp0d"), Lit::Value(Value::Double(10.0)));
+        assert_eq!(lit("0x1_0p0"), Lit::Value(Value::Double(16.0)));
+        assert_eq!(lit("0x1.8p+1"), Lit::Value(Value::Double(3.0)));
+    }
+
+    /// 结果按 IEEE 754 的位比较：就近舍入、平局取偶、次正规数、最大值、零。
+    #[test]
+    fn hex_float_rounding_and_range() {
+        // 尾数很长或指数很大时中间结果不能溢出
+        let zeros = "0".repeat(260);
+        assert_eq!(double_bits(&format!("0x1.{zeros}p0")), 1.0_f64.to_bits());
+        assert_eq!(double_bits(&format!("0x{zeros}1p0")), 1.0_f64.to_bits());
+        assert_eq!(double_bits("0x0p2147483647"), 0);
+        assert_eq!(double_bits("0x0.0p-99999999999999999999"), 0);
+        // double：平局取偶，多一点就进位
+        assert_eq!(double_bits("0x1.00000000000008p0"), 0x3ff0_0000_0000_0000);
+        assert_eq!(double_bits("0x1.00000000000018p0"), 0x3ff0_0000_0000_0002);
+        assert_eq!(
+            double_bits("0x1.00000000000008001p0"),
+            0x3ff0_0000_0000_0001
+        );
+        // 次正规数和下溢
+        assert_eq!(double_bits("0x1p-1074"), 1);
+        assert_eq!(double_bits("0x1p-1075"), 0);
+        assert_eq!(double_bits("0x1.8p-1075"), 1);
+        assert_eq!(double_bits("0x1p-99999999999"), 0);
+        // 最大值和上溢（javac 报错）
+        assert_eq!(double_bits("0x1.fffffffffffffp1023"), f64::MAX.to_bits());
+        assert_eq!(double_bits("0x1.fffffffffffff7p1023"), f64::MAX.to_bits());
+        assert!(is_rejected("0x1.fffffffffffff8p1023"));
+        assert!(is_rejected("0x1p1024"));
+        assert!(is_rejected("0x1p99999999999"));
+        // float：直接按 float 的精度舍入，不是先舍入成 double
+        assert_eq!(float_bits("0x1.00000100000001p0f"), 0x3f80_0001);
+        assert_eq!(float_bits("0x1.000001p0f"), 0x3f80_0000);
+        assert_eq!(float_bits("0x1p-149f"), 1);
+        assert_eq!(float_bits("0x1p-150f"), 0);
+        assert_eq!(float_bits("0x1.fffffep127f"), f32::MAX.to_bits());
+        assert!(is_rejected("0x1p128f"));
+        // 没有指数、没有数字的不是浮点字面量
+        assert!(is_rejected("0x1.8"));
+        assert!(is_rejected("0xp1"));
     }
 
     #[test]
