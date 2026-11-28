@@ -39,6 +39,29 @@ def javaAnalyzerBuildPath = { g ->
     }
     names
 }
+// Resolve a generated source root by stripping the package directories declared in the file
+// (build/generated/.../out/com/x/Y.java -> build/generated/.../out)
+def javaAnalyzerSourceRootOf = { File f ->
+    def pkg = null
+    try {
+        def reader = new BufferedReader(new InputStreamReader(new FileInputStream(f), 'UTF-8'))
+        try {
+            for (int i = 0; i < 60 && pkg == null; i++) {
+                def line = reader.readLine()
+                if (line == null) break
+                def m = line =~ /^\s*package\s+([\p{L}\p{N}_$.]+)\s*;/
+                if (m.find()) pkg = m.group(1)
+            }
+        } finally {
+            reader.close()
+        }
+    } catch (Throwable ignored) {
+    }
+    if (pkg == null) return null
+    def dir = f.parentFile
+    pkg.split('\\.').length.times { dir = dir == null ? null : dir.parentFile }
+    dir
+}
 allprojects { p ->
     p.afterEvaluate {
         def sourceSets = p.extensions.findByName('sourceSets')
@@ -79,6 +102,10 @@ allprojects { p ->
                     if (variants.isEmpty()) {
                         try { variants = androidExtension.libraryVariants ?: [] } catch (Throwable ignored) {}
                     }
+                    // Generated roots exist once per variant (debug/release both produce a
+                    // BuildConfig). Take the first variant that yields any, so the same class
+                    // is not declared in two different directories.
+                    def generatedTaken = false
                     variants.each { v ->
                         try {
                             def jc = v.javaCompileProvider.get()
@@ -87,6 +114,19 @@ allprojects { p ->
                             // sourceSets instead, which is stable across AGP versions.
                             v.sourceSets.each { sset ->
                                 sset.java.srcDirs.each { srcDirsAll << it.absolutePath }
+                            }
+                            // AIDL, BuildConfig, annotation processors and KSP sources are not
+                            // listed in variant.sourceSets; they only show up in the javac task's
+                            // source tree, so derive the roots from the generated files.
+                            if (!generatedTaken) {
+                                def before = srcDirsAll.size()
+                                jc.source.files.each { f ->
+                                    def path = f.absolutePath
+                                    if (!path.startsWith(buildDir) || !path.endsWith('.java')) return
+                                    def root = javaAnalyzerSourceRootOf(f)
+                                    if (root != null && root.isDirectory()) srcDirsAll << root.absolutePath
+                                }
+                                generatedTaken = srcDirsAll.size() > before
                             }
                         } catch (Throwable ignored) {
                         }
