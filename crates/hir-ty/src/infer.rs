@@ -1130,9 +1130,22 @@ impl<'a> InferCtx<'a> {
     /// `from` 确定不能赋给 `to`（见 [`crate::subtype::Incompatibility`]）。类型变量只认当前
     /// 作用域里的，类的层次结构要可靠。
     pub(crate) fn certainly_incompatible(&self, from: &Ty, to: &Ty) -> bool {
+        self.certainly_incompatible_inferring(from, to, &|_| None)
+    }
+
+    /// 同 [`Self::certainly_incompatible`]，`inferred` 见
+    /// [`crate::subtype::Incompatibility::with_inferred`]。
+    pub(crate) fn certainly_incompatible_inferring(
+        &self,
+        from: &Ty,
+        to: &Ty,
+        inferred: &dyn Fn(TypeParamId) -> Option<Vec<Ty>>,
+    ) -> bool {
         let reliable = |class: ClassId| self.hierarchy_is_reliable(class);
         let in_scope = |param: TypeParamId| self.type_param_in_scope(param);
-        crate::subtype::Incompatibility::new(self.db, &reliable, &in_scope).not_assignable(from, to)
+        crate::subtype::Incompatibility::new(self.db, &reliable, &in_scope)
+            .with_inferred(inferred)
+            .not_assignable(from, to)
     }
 
     /// 类型变量属于当前方法，或者当前类及其外层类（不是某个函数式接口等别处的类型参数）。
