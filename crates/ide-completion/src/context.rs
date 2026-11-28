@@ -13,7 +13,7 @@ use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 use syntax::{
     ast::{self, AstNode},
-    SyntaxKind, SyntaxNode, SyntaxToken, TextRange, TextSize,
+    Parse, SyntaxKind, SyntaxNode, SyntaxToken, TextRange, TextSize,
 };
 
 use crate::CompletionConfig;
@@ -242,7 +242,8 @@ impl<'a> CompletionContext<'a> {
             return None;
         }
         let sema = Semantics::new(db);
-        let original_root = base_db::parse(db, file).syntax_node();
+        let original = base_db::parse(db, file);
+        let original_root = original.syntax_node();
 
         // 注释和字符串里不补全；文档注释里只补全 Javadoc 标签
         let mut doc_comment = None;
@@ -422,7 +423,7 @@ impl<'a> CompletionContext<'a> {
             ctx.fake_terminator = true;
         }
         fake_text.push_str(&text[pos..]);
-        let fake_root = ast::CompilationUnit::parse(&fake_text).syntax_node();
+        let fake_root = fake_tree(&original, offset, &fake_text);
         let fake_token = fake_root
             .token_at_offset(offset)
             .find(|t| t.kind() == SyntaxKind::IDENT && t.text().contains(MARKER))?;
@@ -863,6 +864,24 @@ impl<'a> CompletionContext<'a> {
     }
 }
 
+/// 假树的根节点：`fake_text` 是原文件在 `offset` 处插入占位符之后的文本。
+///
+/// 光标在方法体、构造器体或初始化块里时，只重新解析那一个块（块级增量重解析），结果与
+/// 整文件解析完全相同（见 `Parse::reparse`）。这是最常见的补全位置，省掉的是每次请求
+/// 一次的整文件解析。`reparse` 只在能够保证这一点时适用：其它位置（类体、签名、字段
+/// 初始化式……），以及占位符让解析器提前结束这个块的时候（例如它独占语句的开头、后面
+/// 还跟着标识符，被当成 `类型 名字` 的声明），都照旧整文件解析。
+fn fake_tree(
+    original: &Parse<ast::CompilationUnit>,
+    offset: TextSize,
+    fake_text: &str,
+) -> SyntaxNode {
+    original
+        .reparse(TextRange::empty(offset), fake_text)
+        .unwrap_or_else(|| ast::CompilationUnit::parse(fake_text))
+        .syntax_node()
+}
+
 /// 类型后面已经写好的声明名字：字段 / 局部变量 / 形参的名字，方法名。
 fn declared_name(owner: &SyntaxNode) -> Option<SmolStr> {
     let name = match owner.kind() {
@@ -1200,6 +1219,126 @@ fn doc_owner(node: &SyntaxNode) -> DocOwner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use syntax::green_eq;
+
+    /// 各种位置的样本：方法体、构造器体、初始化块，体里的 lambda、匿名类、数组初始化式，
+    /// 以及含花括号的字符串和注释。
+    const SOURCE: &str = r#"class A {
+    int x = 1;
+    String s = "{\"}"; // }
+
+    void f(int n) {
+        Runnable r = () -> {
+            for (int i = 0; i < n; i++) {
+                x += i;
+            }
+        };
+
+        f(n - 1);
+
+        List<String> names = null;
+        int[] a = { 1, 2 };
+        Object o = new Object() {
+            int g() {
+                return n;
+            }
+        };
+        return n;
+    }
+
+    A() {
+        x = 2;
+    }
+
+    {
+        f(1);
+    }
+}
+"#;
+
+    /// 在 `offset` 处插入占位符之后的文本；`terminator`：占位符后面是否补了分号。
+    fn fake_text(source: &str, offset: usize, terminator: bool) -> String {
+        let mut fake = String::with_capacity(source.len() + MARKER.len() + 1);
+        fake.push_str(&source[..offset]);
+        fake.push_str(MARKER);
+        if terminator {
+            fake.push(';');
+        }
+        fake.push_str(&source[offset..]);
+        fake
+    }
+
+    /// 假树必须与整文件解析给出的树完全相同（补不补分号两种文本都比）。
+    fn assert_fake_tree_equals_full_parse(source: &str, offset: usize) {
+        let original = ast::CompilationUnit::parse(source);
+        for terminator in [false, true] {
+            let fake = fake_text(source, offset, terminator);
+            let expected = ast::CompilationUnit::parse(&fake).syntax_node();
+            let actual = fake_tree(&original, TextSize::from(offset as u32), &fake);
+            assert!(
+                green_eq(&actual.green(), &expected.green()),
+                "offset {offset}, terminator {terminator}"
+            );
+        }
+    }
+
+    #[test]
+    fn fake_tree_equals_full_parse_at_every_position() {
+        assert!(
+            ast::CompilationUnit::parse(SOURCE).errors().is_empty(),
+            "样本本身不应当有语法错误"
+        );
+        for offset in 0..=SOURCE.len() {
+            if SOURCE.is_char_boundary(offset) {
+                assert_fake_tree_equals_full_parse(SOURCE, offset);
+            }
+        }
+    }
+
+    #[test]
+    fn fake_tree_in_bodies_takes_the_incremental_path() {
+        let original = ast::CompilationUnit::parse(SOURCE);
+        // 光标在这些文本之后：都在某个方法体、构造器体或初始化块里面，`reparse` 必须适用，
+        // 而且结果与整文件解析相同
+        for (before, description) in [
+            ("void f(int n) {", "方法体"),
+            ("() -> {", "方法体里的 lambda"),
+            ("int g() {", "匿名类的方法"),
+            ("A() {", "构造器体"),
+            ("f(1);", "初始化块"),
+        ] {
+            let offset = SOURCE.find(before).expect("样本里应当有这段代码") + before.len();
+            let fake = fake_text(SOURCE, offset, false);
+            assert!(
+                original
+                    .reparse(TextRange::empty(TextSize::from(offset as u32)), &fake)
+                    .is_some(),
+                "{description}里的光标应当走增量路径"
+            );
+            assert_fake_tree_equals_full_parse(SOURCE, offset);
+        }
+        // `reparse` 不适用的位置：类体、参数表、字段初始化式；以及占位符独占语句的开头、后面
+        // 还跟着标识符的时候（解析器把 `占位符 名字` 当成声明：后面是 `(` 时是成员声明，是
+        // `<` 时停在类型实参上，块都在这里提前结束）。都退回整文件解析，结果相同
+        for (before, description) in [
+            ("class A {", "类体"),
+            ("void f(int ", "参数表"),
+            ("int x = ", "字段初始化式"),
+            ("    {\n", "初始化块的开头"),
+            ("        };\n\n", "下一行以 `f(n - 1);` 开头的空行"),
+            ("f(n - 1);\n\n", "下一行以 `List<String>` 开头的空行"),
+        ] {
+            let offset = SOURCE.find(before).expect("样本里应当有这段代码") + before.len();
+            let fake = fake_text(SOURCE, offset, false);
+            assert!(
+                original
+                    .reparse(TextRange::empty(TextSize::from(offset as u32)), &fake)
+                    .is_none(),
+                "{description}里的光标不应走增量路径"
+            );
+            assert_fake_tree_equals_full_parse(SOURCE, offset);
+        }
+    }
 
     #[test]
     fn following_classifies_what_comes_after_the_name() {
