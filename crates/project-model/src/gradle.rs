@@ -392,6 +392,8 @@ fn cache_key(root: &Path) -> u64 {
     let mut hasher = DefaultHasher::new();
     root.hash(&mut hasher);
     INIT_SCRIPT.hash(&mut hasher);
+    EXPORT_ARGS.hash(&mut hasher);
+    CONFIGURE_ALL.hash(&mut hasher);
     for file in build_files(root) {
         file.hash(&mut hasher);
         if let Ok(content) = std::fs::read(&file) {
@@ -429,9 +431,23 @@ fn run_gradle(root: &Path) -> Result<String, String> {
     } else {
         PathBuf::from("gradle")
     };
+    let result = export(&program, root, &script, &output, &[CONFIGURE_ALL])
+        .or_else(|_| export(&program, root, &script, &output, &[]));
+    let _ = std::fs::remove_file(&script);
+    result
+}
+
+/// 运行一次导出（等 wrapper 锁时重试），读出模型。
+fn export(
+    program: &Path,
+    root: &Path,
+    script: &Path,
+    output: &Path,
+    extra: &[&str],
+) -> Result<String, String> {
     let mut attempt = 1;
     let result = loop {
-        let result = run_export(&program, root, &script, &output);
+        let result = run_export(program, root, script, output, extra);
         match &result {
             Ok(out)
                 if !out.status.success()
@@ -443,7 +459,6 @@ fn run_gradle(root: &Path) -> Result<String, String> {
             _ => break result,
         }
     };
-    let _ = std::fs::remove_file(&script);
 
     let result = result.map_err(|e| {
         base_db::tr!(
@@ -453,7 +468,7 @@ fn run_gradle(root: &Path) -> Result<String, String> {
         )
     })?;
     if !result.status.success() {
-        let _ = std::fs::remove_dir_all(&output);
+        let _ = std::fs::remove_dir_all(output);
         let stderr = String::from_utf8_lossy(&result.stderr);
         let tail: Vec<&str> = stderr.lines().rev().take(15).collect();
         let tail: Vec<&str> = tail.into_iter().rev().collect();
@@ -463,13 +478,13 @@ fn run_gradle(root: &Path) -> Result<String, String> {
             tail.join("\n")
         ));
     }
-    let json = read_model_dir(&output).map_err(|e| {
+    let json = read_model_dir(output).map_err(|e| {
         base_db::tr!(
             "读取导出的模型失败: {e}",
             "Failed to read the exported model: {e}"
         )
     });
-    let _ = std::fs::remove_dir_all(&output);
+    let _ = std::fs::remove_dir_all(output);
     json
 }
 
@@ -481,11 +496,27 @@ fn waited_for_wrapper_lock(stderr: &str) -> bool {
     stderr.contains("waiting for exclusive access to file") && stderr.contains("org.gradle.wrapper")
 }
 
+/// 导出时固定传给 Gradle 的参数，也参与缓存键：参数变了，旧参数导出的模型要作废。
+const EXPORT_ARGS: &[&str] = &[
+    // 导出任务在执行时读工程模型，和配置缓存不兼容；旧版本 Gradle 不认识的系统属性会被忽略
+    "-Dorg.gradle.configuration-cache=false",
+    "-Dorg.gradle.unsafe.configuration-cache=false",
+    "-q",
+    "--console=plain",
+    ":javaAnalyzerModels",
+];
+
+/// 导出任务要读每个工程的模型；按需配置会让子工程不被配置，它们的 afterEvaluate 注册不会执行。
+/// 但按需配置也会跳过配置时就出错的子工程，关掉后整个导出失败；这时按工程自己的设置再导出一次，
+/// 缓存实际用到的模型（修好坏子工程会改变构建文件，缓存键随之变化，下次会重新尝试完整导出）。
+const CONFIGURE_ALL: &str = "-Dorg.gradle.configureondemand=false";
+
 fn run_export(
     program: &Path,
     root: &Path,
     script: &Path,
     output: &Path,
+    extra: &[&str],
 ) -> std::io::Result<std::process::Output> {
     let _ = std::fs::remove_dir_all(output);
     Command::new(program)
@@ -493,10 +524,8 @@ fn run_export(
         .arg("--init-script")
         .arg(script)
         .arg(format!("-DjavaAnalyzer.output={}", output.display()))
-        // 导出任务在执行时读工程模型，和配置缓存不兼容；旧版本 Gradle 不认识的系统属性会被忽略
-        .arg("-Dorg.gradle.configuration-cache=false")
-        .arg("-Dorg.gradle.unsafe.configuration-cache=false")
-        .args(["-q", "--console=plain", ":javaAnalyzerModels"])
+        .args(extra)
+        .args(EXPORT_ARGS)
         .output()
 }
 
@@ -804,6 +833,42 @@ mod tests {
         let stderr = "Exception in thread \"main\" java.lang.RuntimeException: Timeout of 120000 reached waiting for exclusive access to file: /home/u/.gradle/wrapper/dists/gradle-9.9.1-bin/x/gradle-9.9.1-bin.zip\n\tat org.gradle.internal.file.locking.ExclusiveFileAccessManager.access(SourceFile:3)\n\tat org.gradle.wrapper.Install.createDist(SourceFile:21)\n";
         assert!(waited_for_wrapper_lock(stderr));
         assert!(!waited_for_wrapper_lock("FAILURE: Build failed with an exception.\n* What went wrong:\nCould not resolve all dependencies"));
+    }
+
+    #[test]
+    fn export_disables_configure_on_demand() {
+        assert_eq!(CONFIGURE_ALL, "-Dorg.gradle.configureondemand=false");
+    }
+
+    /// 按需配置原本跳过的坏子工程会让关掉按需配置的导出失败，这时退回按工程自己的设置导出
+    #[cfg(unix)]
+    #[test]
+    fn failed_export_retries_with_configure_on_demand() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("ja-gradle-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let gradlew = root.join("gradlew");
+        std::fs::write(
+            &gradlew,
+            r#"#!/bin/sh
+for a in "$@"; do
+  case "$a" in
+    -Dorg.gradle.configureondemand=false) echo "boom" >&2; exit 1;;
+    -DjavaAnalyzer.output=*) out="${a#-DjavaAnalyzer.output=}";;
+  esac
+done
+mkdir -p "$out" && echo '{"path":":"}' > "$out/root.json"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&gradlew, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let json = run_gradle(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            json.unwrap().replace(char::is_whitespace, ""),
+            r#"[{"path":":"}]"#
+        );
     }
 
     #[test]

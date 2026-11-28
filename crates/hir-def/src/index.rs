@@ -696,11 +696,17 @@ pub fn direct_supers(db: &dyn Db, id: ClassId) -> Arc<Vec<ClassId>> {
         return Arc::default();
     }
     RESOLVING_SUPERS.with(|stack| stack.borrow_mut().push(id));
-    let res = direct_supers_query(db, id);
-    RESOLVING_SUPERS.with(|stack| {
-        stack.borrow_mut().pop();
-    });
-    res
+    // salsa 的取消以 panic 展开，展开时也要出栈
+    struct PopOnDrop;
+    impl Drop for PopOnDrop {
+        fn drop(&mut self) {
+            RESOLVING_SUPERS.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+    let _guard = PopOnDrop;
+    direct_supers_query(db, id)
 }
 
 /// 所有祖先类型（不含自身），广度优先；`java.lang.Object` 总在其中（如果存在）。
