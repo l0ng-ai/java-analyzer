@@ -6,8 +6,8 @@
 
 use base_db::Db;
 use hir::{
-    all_super_tys, class_data, class_header, method_sig, ClassId, GenericOwner, MethodId, Modifiers,
-    Subst, Ty, Visibility, Wildcard,
+    all_super_tys, class_data, class_header, method_sig, ClassId, GenericOwner, MethodId,
+    Modifiers, Subst, Ty, Visibility, Wildcard,
 };
 
 /// `method` 覆写（或者以静态方法隐藏）的一个祖先方法。
